@@ -15,7 +15,6 @@ R2_BUCKET_NAME = "jw-music"
 R2_ENDPOINT_URL = "https://5235806c506db968f42f6b4bf16a58e2.r2.cloudflarestorage.com"
 R2_ACCESS_KEY_ID = "12717da3e1fde17117a865ecb1b14f87"
 R2_SECRET_ACCESS_KEY = "bed6e082d02b745775c5b5540b9105d6c14822e73ca25454b084679a88bab218"
-
 s3_client = boto3.client(
     "s3",
     endpoint_url=R2_ENDPOINT_URL,
@@ -29,7 +28,7 @@ metadata_cache = {}
 cover_cache = {}
 file_list_cache = None
 file_list_timestamp = 0
-CACHE_TTL = 3600  # Aggiornamento lista ogni 10 ore / 1 ora
+CACHE_TTL = 3600  # 1 ora
 
 
 # FUNZIONE DI PRE-CACHING TOTALE (Eseguita in background all'avvio)
@@ -108,7 +107,7 @@ def warm_up_cache():
     print(f"❌ Errore durante il warm-up: {e}")
 
 
-# Avvia il riscaldamento in un thread separato per non bloccare l'avvio di Flask
+# Avvia il riscaldamento in un thread separato
 threading.Thread(target=warm_up_cache, daemon=True).start()
 
 
@@ -120,17 +119,27 @@ def home():
 @app.route("/api/list")
 def api_list():
   global file_list_cache, file_list_timestamp
-  current_time = time.time()
+  
+  # Se la cache è vuota o non pronta, effettua una scansione di emergenza per evitare errori 500
+  if file_list_cache is None or len(file_list_cache) == 0:
+    try:
+      files = []
+      paginator = s3_client.get_paginator("list_objects_v2")
+      page_iterator = paginator.paginate(Bucket=R2_BUCKET_NAME)
 
-  if file_list_cache is not None and (
-      current_time - file_list_timestamp < CACHE_TTL
-  ):
-    return jsonify(file_list_cache)
+      for page in page_iterator:
+        if "Contents" in page:
+          for obj in page["Contents"]:
+            key = obj["Key"]
+            if key.lower().endswith(".mp3"):
+              files.append(key)
+      
+      file_list_cache = files
+      file_list_timestamp = time.time()
+    except Exception as e:
+      print(f"⚠️ Errore recupero lista R2: {e}")
 
-  # Se scade il TTL, aggiorna in background o restituisci la cache
-  if file_list_cache is not None:
-    return jsonify(file_list_cache)
-  return jsonify([]), 500
+  return jsonify(file_list_cache if file_list_cache is not None else [])
 
 
 @app.route("/api/metadata")
@@ -139,7 +148,6 @@ def api_metadata():
   if not file_key:
     return jsonify({"error": "File non specificato"}), 400
 
-  # Se è in cache (grazie al warm-up iniziale), risponde in un millisecondo
   if file_key in metadata_cache:
     return jsonify(metadata_cache[file_key])
 
