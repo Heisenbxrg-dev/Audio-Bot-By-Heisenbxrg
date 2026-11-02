@@ -26,7 +26,6 @@ def home():
   return "Audio Bot Proxy Server is running 24/7!"
 
 
-# Rotta API con Paginazione per leggere TUTTI i brani da R2 (senza limiti)
 @app.route("/api/list")
 def api_list():
   try:
@@ -43,11 +42,10 @@ def api_list():
 
     return jsonify(files)
   except Exception as e:
-    print(f"Errore listing R2 con paginazione: {e}")
+    print(f"Errore listing R2: {e}")
     return jsonify([]), 500
 
 
-# Rotta API per leggere i metadati con i primi byte da R2
 @app.route("/api/metadata")
 def api_metadata():
   file_key = request.args.get("file")
@@ -55,45 +53,27 @@ def api_metadata():
     return jsonify({"error": "File non specificato"}), 400
 
   try:
-    response = s3_client.get_object(
-        Bucket=R2_BUCKET_NAME, Key=file_key, Range="bytes=0-524288"
+    # Estraiamo la cartella/sottocartella come Album
+    parts = file_key.split("/")
+    if len(parts) > 1:
+      album_name = parts[
+          -2
+      ]  # Prende la cartella immediatamente sopra il file
+    else:
+      album_name = "Cloudflare R2"
+
+    filename = parts[-1]
+    title = os.path.splitext(filename)[0]
+
+    return jsonify(
+        {"title": title, "album": album_name, "folder_path": file_key}
     )
-    file_bytes = io.BytesIO(response["Body"].read())
-
-    audio = MP3(file_bytes, ID3=ID3)
-    title = os.path.splitext(os.path.basename(file_key))[0]
-    album = "Cloudflare R2"
-    year = "Streaming"
-    has_cover = False
-
-    if audio.tags:
-      if "TIT2" in audio.tags:
-        title = str(audio.tags["TIT2"])
-      if "TALB" in audio.tags:
-        album = str(audio.tags["TALB"])
-      if "TDRC" in audio.tags:
-        year = str(audio.tags["TDRC"])
-      elif "TYER" in audio.tags:
-        year = str(audio.tags["TYER"])
-
-      for tag_key in audio.tags.keys():
-        if tag_key.startswith("APIC"):
-          has_cover = True
-          break
-
-    return jsonify({
-        "title": title,
-        "album": album,
-        "year": year,
-        "has_cover": has_cover,
-    })
   except Exception as e:
     filename = os.path.basename(file_key)
     return jsonify({
         "title": os.path.splitext(filename)[0],
         "album": "Cloudflare R2",
-        "year": "Streaming",
-        "has_cover": False,
+        "folder_path": file_key,
     })
 
 
@@ -106,7 +86,6 @@ def download_file():
   try:
     file_obj = s3_client.get_object(Bucket=R2_BUCKET_NAME, Key=file_key)
     filename = os.path.basename(file_key)
-
     return send_file(
         file_obj["Body"],
         as_attachment=True,
