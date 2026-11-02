@@ -12,7 +12,6 @@ R2_BUCKET_NAME = "jw-music"
 R2_ENDPOINT_URL = "https://5235806c506db968f42f6b4bf16a58e2.r2.cloudflarestorage.com"
 R2_ACCESS_KEY_ID = "12717da3e1fde17117a865ecb1b14f87"
 R2_SECRET_ACCESS_KEY = "bed6e082d02b745775c5b5540b9105d6c14822e73ca25454b084679a88bab218"
-
 s3_client = boto3.client(
     "s3",
     endpoint_url=R2_ENDPOINT_URL,
@@ -27,7 +26,7 @@ def home():
   return "Audio Bot Proxy Server is running 24/7!"
 
 
-# Rotta API con Paginazione per leggere TUTTI i brani da R2 (senza limiti a 1000)
+# Rotta API con Paginazione per leggere TUTTI i brani da R2 (senza limiti)
 @app.route("/api/list")
 def api_list():
   try:
@@ -48,7 +47,7 @@ def api_list():
     return jsonify([]), 500
 
 
-# Rotta API per estrarre i metadati ID3 (Album, Anno/Era, Titolo) dai primi byte del file su R2
+# Rotta API per estrarre i metadati ID3 reali (Album, Anno/Era, Titolo) dai primi 2MB del file su R2
 @app.route("/api/metadata")
 def api_metadata():
   file_key = request.args.get("file")
@@ -56,9 +55,9 @@ def api_metadata():
     return jsonify({"error": "File non specificato"}), 400
 
   try:
-    # Scarica solo i primi 512KB per leggere i tag ID3 senza consumare banda inutile
+    # Scarica i primi 2MB per catturare correttamente i tag ID3 e le copertine
     response = s3_client.get_object(
-        Bucket=R2_BUCKET_NAME, Key=file_key, Range="bytes=0-524288"
+        Bucket=R2_BUCKET_NAME, Key=file_key, Range="bytes=0-2097152"
     )
     file_bytes = io.BytesIO(response["Body"].read())
 
