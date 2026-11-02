@@ -20,18 +20,33 @@ s3_client = boto3.client(
     region_name="auto",
 )
 
-# DIZIONARIO DI CACHE IN MEMORIA (Elimina i download ripetuti da R2)
+# DIZIONARI DI CACHE IN MEMORIA (RAM)
 metadata_cache = {}
 cover_cache = {}
+
+# Cache dedicata alla lista dei file
+file_list_cache = None
+file_list_timestamp = 0
+CACHE_TTL = 3600  # La lista si aggiorna automaticamente ogni 10 minuti (600 secondi)
 
 
 @app.route("/")
 def home():
-  return "Audio Bot Proxy Server is running 24/7 (Optimized Cache)!"
+  return "Audio Bot Proxy Server is running 24/7 (Full RAM Cache)!"
 
 
+# Rotta API Lista con Cache e TTL (Velocissima)
 @app.route("/api/list")
 def api_list():
+  global file_list_cache, file_list_timestamp
+  current_time = time.time()
+
+  # Se la cache è valida (meno di 10 minuti), restituisci subito i file in RAM
+  if file_list_cache is not None and (
+      current_time - file_list_timestamp < CACHE_TTL
+  ):
+    return jsonify(file_list_cache)
+
   try:
     files = []
     paginator = s3_client.get_paginator("list_objects_v2")
@@ -44,9 +59,16 @@ def api_list():
           if key.lower().endswith(".mp3"):
             files.append(key)
 
+    # Aggiorna la cache in memoria
+    file_list_cache = files
+    file_list_timestamp = current_time
+
     return jsonify(files)
   except Exception as e:
     print(f"Errore listing R2: {e}")
+    # Se c'è un errore ma abbiamo una vecchia cache, usa quella per continuità
+    if file_list_cache is not None:
+      return jsonify(file_list_cache)
     return jsonify([]), 500
 
 
@@ -56,7 +78,7 @@ def api_metadata():
   if not file_key:
     return jsonify({"error": "File non specificato"}), 400
 
-  # SE È GIÀ IN CACHE, RISPONDI ALL'ISTANTE (VELOCISSIMO)
+  # Se i metadati sono già in cache, restituiscili all'istante
   if file_key in metadata_cache:
     return jsonify(metadata_cache[file_key])
 
@@ -94,7 +116,6 @@ def api_metadata():
     if os.path.exists(tmp_path):
       os.remove(tmp_path)
 
-    # Salviamo anche la copertina nella cache immagini per evitare futuri download
     if cover_data:
       cover_cache[file_key] = {"data": cover_data, "mime": mime_type}
 
@@ -105,7 +126,6 @@ def api_metadata():
         "has_cover": has_cover,
     }
 
-    # Memorizziamo in cache
     metadata_cache[file_key] = result
     return jsonify(result)
 
@@ -129,7 +149,6 @@ def get_cover():
   if not file_key:
     return "File non specificato", 400
 
-  # Se la copertina è già in cache RAM, servila subito senza scaricare il file
   if file_key in cover_cache:
     c_info = cover_cache[file_key]
     return send_file(
