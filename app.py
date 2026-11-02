@@ -20,13 +20,16 @@ s3_client = boto3.client(
     region_name="auto",
 )
 
+# DIZIONARIO DI CACHE IN MEMORIA (Elimina i download ripetuti da R2)
+metadata_cache = {}
+cover_cache = {}
+
 
 @app.route("/")
 def home():
-  return "Audio Bot Proxy Server is running 24/7!"
+  return "Audio Bot Proxy Server is running 24/7 (Optimized Cache)!"
 
 
-# Rotta API con Paginazione per leggere TUTTI i brani da R2
 @app.route("/api/list")
 def api_list():
   try:
@@ -47,12 +50,15 @@ def api_list():
     return jsonify([]), 500
 
 
-# Rotta API per leggere Titolo, Album (Cartella), Durata e presenza Copertina
 @app.route("/api/metadata")
 def api_metadata():
   file_key = request.args.get("file")
   if not file_key:
     return jsonify({"error": "File non specificato"}), 400
+
+  # SE È GIÀ IN CACHE, RISPONDI ALL'ISTANTE (VELOCISSIMO)
+  if file_key in metadata_cache:
+    return jsonify(metadata_cache[file_key])
 
   tmp_path = "temp_meta_audio.mp3"
   try:
@@ -73,21 +79,36 @@ def api_metadata():
       duration_str = f"{mins}:{secs:02d} min"
 
     has_cover = False
+    cover_data = None
+    mime_type = "image/jpeg"
+
     if audio.tags:
       for tag_key in audio.tags.keys():
         if tag_key.startswith("APIC"):
           has_cover = True
+          apic = audio.tags[tag_key]
+          cover_data = apic.data
+          mime_type = apic.mime
           break
 
     if os.path.exists(tmp_path):
       os.remove(tmp_path)
 
-    return jsonify({
+    # Salviamo anche la copertina nella cache immagini per evitare futuri download
+    if cover_data:
+      cover_cache[file_key] = {"data": cover_data, "mime": mime_type}
+
+    result = {
         "title": title,
         "album": album_name,
         "duration": duration_str,
         "has_cover": has_cover,
-    })
+    }
+
+    # Memorizziamo in cache
+    metadata_cache[file_key] = result
+    return jsonify(result)
+
   except Exception as e:
     if os.path.exists(tmp_path):
       os.remove(tmp_path)
@@ -102,12 +123,18 @@ def api_metadata():
     })
 
 
-# Rotta per servire l'immagine di copertina come miniatura per Discord
 @app.route("/cover")
 def get_cover():
   file_key = request.args.get("file")
   if not file_key:
     return "File non specificato", 400
+
+  # Se la copertina è già in cache RAM, servila subito senza scaricare il file
+  if file_key in cover_cache:
+    c_info = cover_cache[file_key]
+    return send_file(
+        io.BytesIO(c_info["data"]), mimetype=c_info["mime"], as_attachment=False
+    )
 
   tmp_path = "temp_cover_audio.mp3"
   try:
@@ -129,6 +156,7 @@ def get_cover():
       os.remove(tmp_path)
 
     if cover_data:
+      cover_cache[file_key] = {"data": cover_data, "mime": mime_type}
       return send_file(
           io.BytesIO(cover_data), mimetype=mime_type, as_attachment=False
       )
