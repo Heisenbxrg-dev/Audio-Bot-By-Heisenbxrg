@@ -26,6 +26,7 @@ def home():
   return "Audio Bot Proxy Server is running 24/7!"
 
 
+# Rotta API con Paginazione per leggere TUTTI i brani da R2
 @app.route("/api/list")
 def api_list():
   try:
@@ -46,6 +47,7 @@ def api_list():
     return jsonify([]), 500
 
 
+# Rotta API per leggere Titolo, Album (Cartella), Durata e presenza Copertina
 @app.route("/api/metadata")
 def api_metadata():
   file_key = request.args.get("file")
@@ -54,20 +56,15 @@ def api_metadata():
 
   tmp_path = "temp_meta_audio.mp3"
   try:
-    # Scarica temporaneamente il file in locale (come faceva in locale sul tuo PC)
-    # così mutagen può leggerlo con pieno accesso e senza restrizioni di streaming.
     s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
-
     audio = MP3(tmp_path, ID3=ID3)
 
-    # Album dalla cartella
     parts = file_key.split("/")
     album_name = parts[-2] if len(parts) > 1 else "Cloudflare R2"
 
     filename = parts[-1]
     title = os.path.splitext(filename)[0]
 
-    # Durata precisa
     duration_str = "Sconosciuta"
     if audio.info and audio.info.length:
       total_seconds = int(audio.info.length)
@@ -75,7 +72,6 @@ def api_metadata():
       secs = total_seconds % 60
       duration_str = f"{mins}:{secs:02d} min"
 
-    # Copertina APIC
     has_cover = False
     if audio.tags:
       for tag_key in audio.tags.keys():
@@ -83,7 +79,6 @@ def api_metadata():
           has_cover = True
           break
 
-    # Pulisce il file temporaneo
     if os.path.exists(tmp_path):
       os.remove(tmp_path)
 
@@ -105,6 +100,44 @@ def api_metadata():
         "duration": "N/D",
         "has_cover": False,
     })
+
+
+# Rotta per servire l'immagine di copertina come miniatura per Discord
+@app.route("/cover")
+def get_cover():
+  file_key = request.args.get("file")
+  if not file_key:
+    return "File non specificato", 400
+
+  tmp_path = "temp_cover_audio.mp3"
+  try:
+    s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
+    audio = MP3(tmp_path, ID3=ID3)
+
+    cover_data = None
+    mime_type = "image/jpeg"
+
+    if audio.tags:
+      for tag_key in audio.tags.keys():
+        if tag_key.startswith("APIC"):
+          apic = audio.tags[tag_key]
+          cover_data = apic.data
+          mime_type = apic.mime
+          break
+
+    if os.path.exists(tmp_path):
+      os.remove(tmp_path)
+
+    if cover_data:
+      return send_file(
+          io.BytesIO(cover_data), mimetype=mime_type, as_attachment=False
+      )
+    else:
+      return "Copertina non trovata", 404
+  except Exception as e:
+    if os.path.exists(tmp_path):
+      os.remove(tmp_path)
+    return f"Errore: {e}", 500
 
 
 @app.route("/download")
