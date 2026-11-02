@@ -5,10 +5,10 @@ from flask import Flask, jsonify, request, send_file, render_template
 app = Flask(__name__)
 
 # Configurazione Cloudflare R2 (usa le credenziali S3 compatibili di R2)
-R2_BUCKET_NAME = "IL_TUO_NOME_BUCKET"
-R2_ENDPOINT_URL = "https://TUO_ACCOUNT_ID.r2.cloudflarestorage.com"
-R2_ACCESS_KEY_ID = "TUA_ACCESS_KEY"
-R2_SECRET_ACCESS_KEY = "TUA_SECRET_KEY"
+R2_BUCKET_NAME = "jw-music"
+R2_ENDPOINT_URL = "https://5235806c506db968f42f6b4bf16a58e2.r2.cloudflarestorage.com"
+R2_ACCESS_KEY_ID = "12717da3e1fde17117a865ecb1b14f87"
+R2_SECRET_ACCESS_KEY = "bed6e082d02b745775c5b5540b9105d6c14822e73ca25454b084679a88bab218"
 
 s3_client = boto3.client(
     "s3",
