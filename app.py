@@ -47,21 +47,19 @@ def api_list():
     return jsonify([]), 500
 
 
-# Rotta API per estrarre i metadati ID3 reali (Album, Anno/Era, Titolo) dai primi 2MB del file su R2
+# Rotta API per estrarre i metadati ID3 reali (Album, Anno/Era, Titolo) scaricando temporaneamente il file
 @app.route("/api/metadata")
 def api_metadata():
   file_key = request.args.get("file")
   if not file_key:
     return jsonify({"error": "File non specificato"}), 400
 
+  tmp_path = "temp_audio.mp3"
   try:
-    # Scarica i primi 2MB per catturare correttamente i tag ID3 e le copertine
-    response = s3_client.get_object(
-        Bucket=R2_BUCKET_NAME, Key=file_key, Range="bytes=0-2097152"
-    )
-    file_bytes = io.BytesIO(response["Body"].read())
+    # Scarica temporaneamente il file in locale per permettere a mutagen di leggerlo perfettamente
+    s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
 
-    audio = MP3(file_bytes, ID3=ID3)
+    audio = MP3(tmp_path, ID3=ID3)
     title = os.path.splitext(os.path.basename(file_key))[0]
     album = "Cloudflare R2"
     year = "Streaming"
@@ -82,6 +80,9 @@ def api_metadata():
           has_cover = True
           break
 
+    if os.path.exists(tmp_path):
+      os.remove(tmp_path)
+
     return jsonify({
         "title": title,
         "album": album,
@@ -89,6 +90,8 @@ def api_metadata():
         "has_cover": has_cover,
     })
   except Exception as e:
+    if os.path.exists(tmp_path):
+      os.remove(tmp_path)
     filename = os.path.basename(file_key)
     return jsonify({
         "title": os.path.splitext(filename)[0],
