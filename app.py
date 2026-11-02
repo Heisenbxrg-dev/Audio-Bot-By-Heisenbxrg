@@ -1,54 +1,39 @@
-import os
-from flask import Flask, send_from_directory, render_template_string, abort
+import urllib.parse
+import requests
+from flask import Flask, Response, request
 
 app = Flask(__name__)
-CANZONI_FOLDER = os.path.abspath("canzoni")
 
-# HTML minimale per la pagina principale con la lista delle canzoni e il download forzato
-HOME_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="it">
-<head>
-    <meta charset="UTF-8">
-    <title>Libreria Audio</title>
-    <style>
-        body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; background: #f4f4f9; color: #333; }
-        h1 { color: #5865F2; }
-        ul { list-style: none; padding: 0; }
-        li { background: white; margin: 10px 0; padding: 15px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
-        a { background: #5865F2; color: white; padding: 8px 15px; border-radius: 5px; text-decoration: none; font-weight: bold; }
-        a:hover { background: #4752c4; }
-    </style>
-</head>
-<body>
-    <h1>🎵 Libreria MP3</h1>
-    <p>Clicca su una canzone per avviare il download automatico:</p>
-    <ul>
-        {% for song in songs %}
-            <li>
-                <span>{{ song }}</span>
-                <a href="/download/{{ song }}">📥 Scarica</a>
-            </li>
-        {% endfor %}
-    </ul>
-</body>
-</html>
-"""
+# Il tuo URL base di Cloudflare R2
+CLOUD_BASE_URL = "https://pub-6a4f25a7900647a89e517a6563265213.r2.dev"
 
-@app.route("/")
-def index():
-    if not os.path.exists(CANZONI_FOLDER):
-        os.makedirs(CANZONI_FOLDER)
-    songs = [f for f in os.listdir(CANZONI_FOLDER) if f.lower().endswith(".mp3")]
-    return render_template_string(HOME_TEMPLATE, songs=songs)
 
-@app.route("/download/<path:filename>")
-def download_file(filename):
-    # L'as_attachment=True forza il browser a scaricare il file anziché aprirlo nel player!
-    try:
-        return send_from_directory(CANZONI_FOLDER, filename, as_attachment=True)
-    except FileNotFoundError:
-        abort(404)
+@app.route("/download")
+def download_file():
+  file_path = request.args.get("file")
+  if not file_path:
+    return "File non specificato", 400
+
+  target_url = f"{CLOUD_BASE_URL}/songs/{file_path}"
+
+  r = requests.get(target_url, stream=True)
+  if r.status_code != 200:
+    return "File non trovato su R2", 404
+
+  filename = file_path.split("/")[-1]
+  decoded_filename = urllib.parse.unquote(filename)
+
+  def generate():
+    for chunk in r.iter_content(chunk_size=8192):
+      yield chunk
+
+  response = Response(generate(), content_type=r.headers.get("content-type"))
+  # Questa intestazione forza il browser a scaricare il file
+  response.headers["Content-Disposition"] = (
+      f"attachment; filename*=UTF-8''{urllib.parse.quote(decoded_filename)}"
+  )
+  return response
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+  app.run(host="0.0.0.0", port=5000)
