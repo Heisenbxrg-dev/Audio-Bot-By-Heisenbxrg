@@ -53,27 +53,53 @@ def api_metadata():
     return jsonify({"error": "File non specificato"}), 400
 
   try:
-    # Estraiamo la cartella/sottocartella come Album
+    # Estraiamo la cartella come Album
     parts = file_key.split("/")
     if len(parts) > 1:
-      album_name = parts[
-          -2
-      ]  # Prende la cartella immediatamente sopra il file
+      album_name = parts[-2]
     else:
       album_name = "Cloudflare R2"
 
     filename = parts[-1]
     title = os.path.splitext(filename)[0]
 
-    return jsonify(
-        {"title": title, "album": album_name, "folder_path": file_key}
+    # Scarichiamo una porzione di byte per leggere durata e copertina con mutagen
+    response = s3_client.get_object(
+        Bucket=R2_BUCKET_NAME, Key=file_key, Range="bytes=0-1048576"
     )
+    file_bytes = io.BytesIO(response["Body"].read())
+
+    audio = MP3(file_bytes, ID3=ID3)
+    duration_str = "Sconosciuta"
+    has_cover = False
+
+    if audio.info and audio.info.length:
+      total_seconds = int(audio.info.length)
+      mins = total_seconds // 60
+      secs = total_seconds % 60
+      duration_str = f"{mins}:{secs:02d} min"
+
+    if audio.tags:
+      for tag_key in audio.tags.keys():
+        if tag_key.startswith("APIC"):
+          has_cover = True
+          break
+
+    return jsonify({
+        "title": title,
+        "album": album_name,
+        "duration": duration_str,
+        "has_cover": has_cover,
+    })
   except Exception as e:
     filename = os.path.basename(file_key)
+    parts = file_key.split("/")
+    album_name = parts[-2] if len(parts) > 1 else "Cloudflare R2"
     return jsonify({
         "title": os.path.splitext(filename)[0],
-        "album": "Cloudflare R2",
-        "folder_path": file_key,
+        "album": album_name,
+        "duration": "N/D",
+        "has_cover": False,
     })
 
 
