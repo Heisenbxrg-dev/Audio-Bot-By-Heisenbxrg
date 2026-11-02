@@ -1,6 +1,9 @@
+import io
 import os
 import boto3
-from flask import Flask, jsonify, request, send_file, render_template
+from flask import Flask, jsonify, render_template, request, send_file
+from mutagen.id3 import APIC, ID3
+from mutagen.mp3 import MP3
 
 app = Flask(__name__)
 
@@ -29,7 +32,6 @@ def home():
 def api_list():
   try:
     files = []
-    # Usiamo il paginator di boto3 per scorrere tutte le pagine del bucket R2
     paginator = s3_client.get_paginator("list_objects_v2")
     page_iterator = paginator.paginate(Bucket=R2_BUCKET_NAME)
 
@@ -44,6 +46,57 @@ def api_list():
   except Exception as e:
     print(f"Errore listing R2 con paginazione: {e}")
     return jsonify([]), 500
+
+
+# Rotta API per estrarre i metadati ID3 (Album, Anno/Era, Titolo) dai primi byte del file su R2
+@app.route("/api/metadata")
+def api_metadata():
+  file_key = request.args.get("file")
+  if not file_key:
+    return jsonify({"error": "File non specificato"}), 400
+
+  try:
+    # Scarica solo i primi 512KB per leggere i tag ID3 senza consumare banda inutile
+    response = s3_client.get_object(
+        Bucket=R2_BUCKET_NAME, Key=file_key, Range="bytes=0-524288"
+    )
+    file_bytes = io.BytesIO(response["Body"].read())
+
+    audio = MP3(file_bytes, ID3=ID3)
+    title = os.path.splitext(os.path.basename(file_key))[0]
+    album = "Cloudflare R2"
+    year = "Streaming"
+    has_cover = False
+
+    if audio.tags:
+      if "TIT2" in audio.tags:
+        title = str(audio.tags["TIT2"])
+      if "TALB" in audio.tags:
+        album = str(audio.tags["TALB"])
+      if "TDRC" in audio.tags:
+        year = str(audio.tags["TDRC"])
+      elif "TYER" in audio.tags:
+        year = str(audio.tags["TYER"])
+
+      for tag_key in audio.tags.keys():
+        if tag_key.startswith("APIC"):
+          has_cover = True
+          break
+
+    return jsonify({
+        "title": title,
+        "album": album,
+        "year": year,
+        "has_cover": has_cover,
+    })
+  except Exception as e:
+    filename = os.path.basename(file_key)
+    return jsonify({
+        "title": os.path.splitext(filename)[0],
+        "album": "Cloudflare R2",
+        "year": "Streaming",
+        "has_cover": False,
+    })
 
 
 @app.route("/download")
