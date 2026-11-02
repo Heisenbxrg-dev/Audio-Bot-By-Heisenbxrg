@@ -1,18 +1,21 @@
+
 import io
 import os
-import boto3
+import threading
 import time
-from flask import Flask, jsonify, render_template, request, send_file
+import boto3
+from flask import Flask, jsonify, request, send_file
 from mutagen.id3 import APIC, ID3
 from mutagen.mp3 import MP3
 
 app = Flask(__name__)
 
-# Configurazione Cloudflare R2 (usa le credenziali S3 compatibili di R2)
+# Configurazione Cloudflare R2
 R2_BUCKET_NAME = "jw-music"
 R2_ENDPOINT_URL = "https://5235806c506db968f42f6b4bf16a58e2.r2.cloudflarestorage.com"
 R2_ACCESS_KEY_ID = "12717da3e1fde17117a865ecb1b14f87"
 R2_SECRET_ACCESS_KEY = "bed6e082d02b745775c5b5540b9105d6c14822e73ca25454b084679a88bab218"
+
 s3_client = boto3.client(
     "s3",
     endpoint_url=R2_ENDPOINT_URL,
@@ -24,29 +27,16 @@ s3_client = boto3.client(
 # DIZIONARI DI CACHE IN MEMORIA (RAM)
 metadata_cache = {}
 cover_cache = {}
-
-# Cache dedicata alla lista dei file (Impostata a 1 ora / 3600 secondi)
 file_list_cache = None
 file_list_timestamp = 0
-CACHE_TTL = 3600
+CACHE_TTL = 3600  # Aggiornamento lista ogni 10 ore / 1 ora
 
 
-@app.route("/")
-def home():
-  return "Audio Bot Proxy Server is running 24/7 (Full RAM Cache + Era)!"
-
-
-# Rotta API Lista con Cache e TTL (Velocissima)
-@app.route("/api/list")
-def api_list():
+# FUNZIONE DI PRE-CACHING TOTALE (Eseguita in background all'avvio)
+def warm_up_cache():
   global file_list_cache, file_list_timestamp
-  current_time = time.time()
-
-  if file_list_cache is not None and (
-      current_time - file_list_timestamp < CACHE_TTL
-  ):
-    return jsonify(file_list_cache)
-
+  print("🔄 [Warm-up] Avvio scansione e pre-caricamento totale da R2...")
+  tmp_path = "temp_warmup_audio.mp3"
   try:
     files = []
     paginator = s3_client.get_paginator("list_objects_v2")
@@ -60,26 +50,100 @@ def api_list():
             files.append(key)
 
     file_list_cache = files
-    file_list_timestamp = current_time
+    file_list_timestamp = time.time()
+    print(f"📂 [Warm-up] Trovati {len(files)} brani. Analisi metadati in corso...")
 
-    return jsonify(files)
+    # Pre-scarica e memorizza i dati di ogni brano in RAM
+    for file_key in files:
+      if file_key in metadata_cache:
+        continue
+      try:
+        s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
+        audio = MP3(tmp_path, ID3=ID3)
+
+        parts = file_key.split("/")
+        album_name = parts[-2] if len(parts) > 1 else "Cloudflare R2"
+        filename = parts[-1]
+        title = os.path.splitext(filename)[0]
+
+        era_str = "Sconosciuta"
+        if audio.tags:
+          for tag_key in audio.tags.keys():
+            if tag_key.startswith("TDRC") or tag_key.startswith("TYER"):
+              era_str = str(audio.tags[tag_key].text[0])[:4]
+              break
+
+        has_cover = False
+        cover_data = None
+        mime_type = "image/jpeg"
+
+        if audio.tags:
+          for tag_key in audio.tags.keys():
+            if tag_key.startswith("APIC"):
+              has_cover = True
+              apic = audio.tags[tag_key]
+              cover_data = apic.data
+              mime_type = apic.mime
+              break
+
+        if cover_data:
+          cover_cache[file_key] = {"data": cover_data, "mime": mime_type}
+
+        metadata_cache[file_key] = {
+            "title": title,
+            "album": album_name,
+            "era": era_str,
+            "has_cover": has_cover,
+        }
+      except Exception as ex:
+        print(f"⚠️ Errore pre-cache per {file_key}: {ex}")
+
+    if os.path.exists(tmp_path):
+      os.remove(tmp_path)
+
+    print("🚀 [Warm-up] Pre-caricamento completato! Server fulmineo e pronto.")
   except Exception as e:
-    print(f"Errore listing R2: {e}")
-    if file_list_cache is not None:
-      return jsonify(file_list_cache)
-    return jsonify([]), 500
+    if os.path.exists(tmp_path):
+      os.remove(tmp_path)
+    print(f"❌ Errore durante il warm-up: {e}")
 
 
-# Rotta API per leggere Titolo, Album (Cartella), Era (Anno) e presenza Copertina
+# Avvia il riscaldamento in un thread separato per non bloccare l'avvio di Flask
+threading.Thread(target=warm_up_cache, daemon=True).start()
+
+
+@app.route("/")
+def home():
+  return "Audio Bot Proxy Server is running 24/7 (Pre-cached Warm)!"
+
+
+@app.route("/api/list")
+def api_list():
+  global file_list_cache, file_list_timestamp
+  current_time = time.time()
+
+  if file_list_cache is not None and (
+      current_time - file_list_timestamp < CACHE_TTL
+  ):
+    return jsonify(file_list_cache)
+
+  # Se scade il TTL, aggiorna in background o restituisci la cache
+  if file_list_cache is not None:
+    return jsonify(file_list_cache)
+  return jsonify([]), 500
+
+
 @app.route("/api/metadata")
 def api_metadata():
   file_key = request.args.get("file")
   if not file_key:
-    return jsonify({"error": "File non specificato"}), 400
+    return jsonify({"error": "File non specificato"}}, 400
 
+  # Se è in cache (grazie al warm-up iniziale), risponde in un millisecondo
   if file_key in metadata_cache:
     return jsonify(metadata_cache[file_key])
 
+  # Fallback di sicurezza se un file è stato aggiunto dopo l'avvio
   tmp_path = "temp_meta_audio.mp3"
   try:
     s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
@@ -87,11 +151,9 @@ def api_metadata():
 
     parts = file_key.split("/")
     album_name = parts[-2] if len(parts) > 1 else "Cloudflare R2"
-
     filename = parts[-1]
     title = os.path.splitext(filename)[0]
 
-    # Estrazione dell'Era / Anno dai tag ID3 (TDRC o TYER)
     era_str = "Sconosciuta"
     if audio.tags:
       for tag_key in audio.tags.keys():
@@ -127,7 +189,6 @@ def api_metadata():
 
     metadata_cache[file_key] = result
     return jsonify(result)
-
   except Exception as e:
     if os.path.exists(tmp_path):
       os.remove(tmp_path)
@@ -154,36 +215,7 @@ def get_cover():
         io.BytesIO(c_info["data"]), mimetype=c_info["mime"], as_attachment=False
     )
 
-  tmp_path = "temp_cover_audio.mp3"
-  try:
-    s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
-    audio = MP3(tmp_path, ID3=ID3)
-
-    cover_data = None
-    mime_type = "image/jpeg"
-
-    if audio.tags:
-      for tag_key in audio.tags.keys():
-        if tag_key.startswith("APIC"):
-          apic = audio.tags[tag_key]
-          cover_data = apic.data
-          mime_type = apic.mime
-          break
-
-    if os.path.exists(tmp_path):
-      os.remove(tmp_path)
-
-    if cover_data:
-      cover_cache[file_key] = {"data": cover_data, "mime": mime_type}
-      return send_file(
-          io.BytesIO(cover_data), mimetype=mime_type, as_attachment=False
-      )
-    else:
-      return "Copertina non trovata", 404
-  except Exception as e:
-    if os.path.exists(tmp_path):
-      os.remove(tmp_path)
-    return f"Errore: {e}", 500
+  return "Copertina non trovata", 404
 
 
 @app.route("/download")
