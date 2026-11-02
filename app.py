@@ -25,15 +25,15 @@ s3_client = boto3.client(
 metadata_cache = {}
 cover_cache = {}
 
-# Cache dedicata alla lista dei file
+# Cache dedicata alla lista dei file (Impostata a 1 ora / 3600 secondi)
 file_list_cache = None
 file_list_timestamp = 0
-CACHE_TTL = 3600  # La lista si aggiorna automaticamente ogni 10 minuti (600 secondi)
+CACHE_TTL = 3600
 
 
 @app.route("/")
 def home():
-  return "Audio Bot Proxy Server is running 24/7 (Full RAM Cache)!"
+  return "Audio Bot Proxy Server is running 24/7 (Full RAM Cache + Era)!"
 
 
 # Rotta API Lista con Cache e TTL (Velocissima)
@@ -42,7 +42,6 @@ def api_list():
   global file_list_cache, file_list_timestamp
   current_time = time.time()
 
-  # Se la cache è valida (meno di 10 minuti), restituisci subito i file in RAM
   if file_list_cache is not None and (
       current_time - file_list_timestamp < CACHE_TTL
   ):
@@ -60,26 +59,24 @@ def api_list():
           if key.lower().endswith(".mp3"):
             files.append(key)
 
-    # Aggiorna la cache in memoria
     file_list_cache = files
     file_list_timestamp = current_time
 
     return jsonify(files)
   except Exception as e:
     print(f"Errore listing R2: {e}")
-    # Se c'è un errore ma abbiamo una vecchia cache, usa quella per continuità
     if file_list_cache is not None:
       return jsonify(file_list_cache)
     return jsonify([]), 500
 
 
+# Rotta API per leggere Titolo, Album (Cartella), Era (Anno) e presenza Copertina
 @app.route("/api/metadata")
 def api_metadata():
   file_key = request.args.get("file")
   if not file_key:
     return jsonify({"error": "File non specificato"}), 400
 
-  # Se i metadati sono già in cache, restituiscili all'istante
   if file_key in metadata_cache:
     return jsonify(metadata_cache[file_key])
 
@@ -94,12 +91,13 @@ def api_metadata():
     filename = parts[-1]
     title = os.path.splitext(filename)[0]
 
-    duration_str = "Sconosciuta"
-    if audio.info and audio.info.length:
-      total_seconds = int(audio.info.length)
-      mins = total_seconds // 60
-      secs = total_seconds % 60
-      duration_str = f"{mins}:{secs:02d} min"
+    # Estrazione dell'Era / Anno dai tag ID3 (TDRC o TYER)
+    era_str = "Sconosciuta"
+    if audio.tags:
+      for tag_key in audio.tags.keys():
+        if tag_key.startswith("TDRC") or tag_key.startswith("TYER"):
+          era_str = str(audio.tags[tag_key].text[0])[:4]
+          break
 
     has_cover = False
     cover_data = None
@@ -123,7 +121,7 @@ def api_metadata():
     result = {
         "title": title,
         "album": album_name,
-        "duration": duration_str,
+        "era": era_str,
         "has_cover": has_cover,
     }
 
@@ -139,7 +137,7 @@ def api_metadata():
     return jsonify({
         "title": os.path.splitext(filename)[0],
         "album": album_name,
-        "duration": "N/D",
+        "era": "N/D",
         "has_cover": False,
     })
 
