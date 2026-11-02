@@ -137,7 +137,7 @@ def api_list():
 def api_metadata():
   file_key = request.args.get("file")
   if not file_key:
-    return jsonify({"error": "File non specificato"}}, 400
+    return jsonify({"error": "File non specificato"}), 400
 
   # Se è in cache (grazie al warm-up iniziale), risponde in un millisecondo
   if file_key in metadata_cache:
