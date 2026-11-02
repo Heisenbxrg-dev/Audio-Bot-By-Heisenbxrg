@@ -24,19 +24,25 @@ def home():
   return "Audio Bot Proxy Server is running 24/7!"
 
 
-# Rotta API che interroga Cloudflare R2 e restituisce la lista dei brani in JSON
+# Rotta API con Paginazione per leggere TUTTI i brani da R2 (senza limiti a 1000)
 @app.route("/api/list")
 def api_list():
   try:
-    response = s3_client.list_objects_v2(Bucket=R2_BUCKET_NAME)
-    files = [
-        obj["Key"]
-        for obj in response.get("Contents", [])
-        if obj["Key"].lower().endswith(".mp3")
-    ]
+    files = []
+    # Usiamo il paginator di boto3 per scorrere tutte le pagine del bucket R2
+    paginator = s3_client.get_paginator("list_objects_v2")
+    page_iterator = paginator.paginate(Bucket=R2_BUCKET_NAME)
+
+    for page in page_iterator:
+      if "Contents" in page:
+        for obj in page["Contents"]:
+          key = obj["Key"]
+          if key.lower().endswith(".mp3"):
+            files.append(key)
+
     return jsonify(files)
   except Exception as e:
-    print(f"Errore listing R2: {e}")
+    print(f"Errore listing R2 con paginazione: {e}")
     return jsonify([]), 500
 
 
@@ -47,7 +53,6 @@ def download_file():
     return "File non specificato", 400
 
   try:
-    # Scarica temporaneamente il file da R2 per servirlo con Content-Disposition: attachment
     file_obj = s3_client.get_object(Bucket=R2_BUCKET_NAME, Key=file_key)
     filename = os.path.basename(file_key)
 
