@@ -1,6 +1,6 @@
-
 import io
 import os
+import re
 import threading
 import time
 import uuid
@@ -33,7 +33,7 @@ file_list_timestamp = 0
 CACHE_TTL = 3600  # 1 ora
 
 
-# FUNZIONE DI PRE-CACHING TOTALE (Eseguita in background all'avvio)
+# FUNZIONE DI PRE-CACHING TOTALE CON ESTRAZIONE ROBUSTA DELL'ERA
 def warm_up_cache():
   global file_list_cache, file_list_timestamp
   print("🔄 [Warm-up] Avvio scansione e pre-caricamento totale da R2...")
@@ -56,7 +56,7 @@ def warm_up_cache():
     for file_key in files:
       if file_key in metadata_cache:
         continue
-      
+
       tmp_path = f"temp_warm_{uuid.uuid4()}.mp3"
       try:
         s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
@@ -67,14 +67,24 @@ def warm_up_cache():
         filename = parts[-1]
         title = os.path.splitext(filename)[0]
 
-        era_str = "Sconosciuta"
+        # Estrazione Era / Anno ultra-robusta con Regex
+        era_str = "N/D"
         if audio.tags:
           for tag_key in audio.tags.keys():
-            if "TDRC" in tag_key or "TYER" in tag_key or "TDAT" in tag_key:
+            if any(
+                k in tag_key.upper()
+                for k in ["TDRC", "TYER", "TYE", "DATE", "YEAR"]
+            ):
               try:
-                val = str(audio.tags[tag_key].text[0])
-                if len(val) >= 4:
-                  era_str = val[:4]
+                tag_obj = audio.tags[tag_key]
+                if hasattr(tag_obj, "text") and tag_obj.text:
+                  val = str(tag_obj.text[0])
+                else:
+                  val = str(tag_obj)
+
+                match = re.search(r"\d{4}", val)
+                if match:
+                  era_str = match.group(0)
                   break
               except:
                 pass
@@ -118,13 +128,13 @@ threading.Thread(target=warm_up_cache, daemon=True).start()
 
 @app.route("/")
 def home():
-  return "Audio Bot Proxy Server is running 24/7 (Robust Metadata)!"
+  return "Audio Bot Proxy Server is running 24/7 (Robust Metadata & Era)!"
 
 
 @app.route("/api/list")
 def api_list():
   global file_list_cache, file_list_timestamp
-  
+
   if file_list_cache is None or len(file_list_cache) == 0:
     try:
       files = []
@@ -137,7 +147,7 @@ def api_list():
             key = obj["Key"]
             if key.lower().endswith(".mp3"):
               files.append(key)
-      
+
       file_list_cache = files
       file_list_timestamp = time.time()
     except Exception as e:
@@ -155,7 +165,6 @@ def api_metadata():
   if file_key in metadata_cache:
     return jsonify(metadata_cache[file_key])
 
-  # Fallback con nome file temporaneo unico (evita sovrapposizioni)
   tmp_path = f"temp_meta_{uuid.uuid4()}.mp3"
   try:
     s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
@@ -166,14 +175,23 @@ def api_metadata():
     filename = parts[-1]
     title = os.path.splitext(filename)[0]
 
-    era_str = "Sconosciuta"
+    # Estrazione Era / Anno ultra-robusta con Regex
+    era_str = "N/D"
     if audio.tags:
       for tag_key in audio.tags.keys():
-        if "TDRC" in tag_key or "TYER" in tag_key or "TDAT" in tag_key:
+        if any(
+            k in tag_key.upper() for k in ["TDRC", "TYER", "TYE", "DATE", "YEAR"]
+        ):
           try:
-            val = str(audio.tags[tag_key].text[0])
-            if len(val) >= 4:
-              era_str = val[:4]
+            tag_obj = audio.tags[tag_key]
+            if hasattr(tag_obj, "text") and tag_obj.text:
+              val = str(tag_obj.text[0])
+            else:
+              val = str(tag_obj)
+
+            match = re.search(r"\d{4}", val)
+            if match:
+              era_str = match.group(0)
               break
           except:
             pass
