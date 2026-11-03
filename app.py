@@ -3,6 +3,7 @@ import io
 import os
 import threading
 import time
+import uuid
 import boto3
 from flask import Flask, jsonify, request, send_file
 from mutagen.id3 import APIC, ID3
@@ -15,6 +16,7 @@ R2_BUCKET_NAME = "jw-music"
 R2_ENDPOINT_URL = "https://5235806c506db968f42f6b4bf16a58e2.r2.cloudflarestorage.com"
 R2_ACCESS_KEY_ID = "12717da3e1fde17117a865ecb1b14f87"
 R2_SECRET_ACCESS_KEY = "bed6e082d02b745775c5b5540b9105d6c14822e73ca25454b084679a88bab218"
+
 s3_client = boto3.client(
     "s3",
     endpoint_url=R2_ENDPOINT_URL,
@@ -35,7 +37,6 @@ CACHE_TTL = 3600  # 1 ora
 def warm_up_cache():
   global file_list_cache, file_list_timestamp
   print("🔄 [Warm-up] Avvio scansione e pre-caricamento totale da R2...")
-  tmp_path = "temp_warmup_audio.mp3"
   try:
     files = []
     paginator = s3_client.get_paginator("list_objects_v2")
@@ -52,10 +53,11 @@ def warm_up_cache():
     file_list_timestamp = time.time()
     print(f"📂 [Warm-up] Trovati {len(files)} brani. Analisi metadati in corso...")
 
-    # Pre-scarica e memorizza i dati di ogni brano in RAM
     for file_key in files:
       if file_key in metadata_cache:
         continue
+      
+      tmp_path = f"temp_warm_{uuid.uuid4()}.mp3"
       try:
         s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
         audio = MP3(tmp_path, ID3=ID3)
@@ -68,9 +70,14 @@ def warm_up_cache():
         era_str = "Sconosciuta"
         if audio.tags:
           for tag_key in audio.tags.keys():
-            if tag_key.startswith("TDRC") or tag_key.startswith("TYER"):
-              era_str = str(audio.tags[tag_key].text[0])[:4]
-              break
+            if "TDRC" in tag_key or "TYER" in tag_key or "TDAT" in tag_key:
+              try:
+                val = str(audio.tags[tag_key].text[0])
+                if len(val) >= 4:
+                  era_str = val[:4]
+                  break
+              except:
+                pass
 
         has_cover = False
         cover_data = None
@@ -78,7 +85,7 @@ def warm_up_cache():
 
         if audio.tags:
           for tag_key in audio.tags.keys():
-            if tag_key.startswith("APIC"):
+            if "APIC" in tag_key:
               has_cover = True
               apic = audio.tags[tag_key]
               cover_data = apic.data
@@ -96,14 +103,12 @@ def warm_up_cache():
         }
       except Exception as ex:
         print(f"⚠️ Errore pre-cache per {file_key}: {ex}")
-
-    if os.path.exists(tmp_path):
-      os.remove(tmp_path)
+      finally:
+        if os.path.exists(tmp_path):
+          os.remove(tmp_path)
 
     print("🚀 [Warm-up] Pre-caricamento completato! Server fulmineo e pronto.")
   except Exception as e:
-    if os.path.exists(tmp_path):
-      os.remove(tmp_path)
     print(f"❌ Errore durante il warm-up: {e}")
 
 
@@ -113,14 +118,13 @@ threading.Thread(target=warm_up_cache, daemon=True).start()
 
 @app.route("/")
 def home():
-  return "Audio Bot Proxy Server is running 24/7 (Pre-cached Warm)!"
+  return "Audio Bot Proxy Server is running 24/7 (Robust Metadata)!"
 
 
 @app.route("/api/list")
 def api_list():
   global file_list_cache, file_list_timestamp
   
-  # Se la cache è vuota o non pronta, effettua una scansione di emergenza per evitare errori 500
   if file_list_cache is None or len(file_list_cache) == 0:
     try:
       files = []
@@ -151,8 +155,8 @@ def api_metadata():
   if file_key in metadata_cache:
     return jsonify(metadata_cache[file_key])
 
-  # Fallback di sicurezza se un file è stato aggiunto dopo l'avvio
-  tmp_path = "temp_meta_audio.mp3"
+  # Fallback con nome file temporaneo unico (evita sovrapposizioni)
+  tmp_path = f"temp_meta_{uuid.uuid4()}.mp3"
   try:
     s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
     audio = MP3(tmp_path, ID3=ID3)
@@ -165,9 +169,14 @@ def api_metadata():
     era_str = "Sconosciuta"
     if audio.tags:
       for tag_key in audio.tags.keys():
-        if tag_key.startswith("TDRC") or tag_key.startswith("TYER"):
-          era_str = str(audio.tags[tag_key].text[0])[:4]
-          break
+        if "TDRC" in tag_key or "TYER" in tag_key or "TDAT" in tag_key:
+          try:
+            val = str(audio.tags[tag_key].text[0])
+            if len(val) >= 4:
+              era_str = val[:4]
+              break
+          except:
+            pass
 
     has_cover = False
     cover_data = None
@@ -175,15 +184,12 @@ def api_metadata():
 
     if audio.tags:
       for tag_key in audio.tags.keys():
-        if tag_key.startswith("APIC"):
+        if "APIC" in tag_key:
           has_cover = True
           apic = audio.tags[tag_key]
           cover_data = apic.data
           mime_type = apic.mime
           break
-
-    if os.path.exists(tmp_path):
-      os.remove(tmp_path)
 
     if cover_data:
       cover_cache[file_key] = {"data": cover_data, "mime": mime_type}
@@ -198,8 +204,6 @@ def api_metadata():
     metadata_cache[file_key] = result
     return jsonify(result)
   except Exception as e:
-    if os.path.exists(tmp_path):
-      os.remove(tmp_path)
     filename = os.path.basename(file_key)
     parts = file_key.split("/")
     album_name = parts[-2] if len(parts) > 1 else "Cloudflare R2"
@@ -209,6 +213,9 @@ def api_metadata():
         "era": "N/D",
         "has_cover": False,
     })
+  finally:
+    if os.path.exists(tmp_path):
+      os.remove(tmp_path)
 
 
 @app.route("/cover")
@@ -223,7 +230,34 @@ def get_cover():
         io.BytesIO(c_info["data"]), mimetype=c_info["mime"], as_attachment=False
     )
 
-  return "Copertina non trovata", 404
+  tmp_path = f"temp_cover_{uuid.uuid4()}.mp3"
+  try:
+    s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
+    audio = MP3(tmp_path, ID3=ID3)
+
+    cover_data = None
+    mime_type = "image/jpeg"
+
+    if audio.tags:
+      for tag_key in audio.tags.keys():
+        if "APIC" in tag_key:
+          apic = audio.tags[tag_key]
+          cover_data = apic.data
+          mime_type = apic.mime
+          break
+
+    if cover_data:
+      cover_cache[file_key] = {"data": cover_data, "mime": mime_type}
+      return send_file(
+          io.BytesIO(cover_data), mimetype=mime_type, as_attachment=False
+      )
+    else:
+      return "Copertina non trovata", 404
+  except Exception as e:
+    return f"Errore: {e}", 500
+  finally:
+    if os.path.exists(tmp_path):
+      os.remove(tmp_path)
 
 
 @app.route("/download")
