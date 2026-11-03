@@ -27,17 +27,14 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, urlencode
+
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, abort, jsonify, redirect, request, send_file
 from mutagen.id3 import ID3
 from werkzeug.middleware.proxy_fix import ProxyFix
-try:
-  from dotenv import load_dotenv
-  load_dotenv()
-except ImportError:
-  pass
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
@@ -80,6 +77,10 @@ s3 = boto3.client(
         retries={"max_attempts": 3, "mode": "standard"},
         connect_timeout=5,
         read_timeout=20,
+        # boto3 >= 1.36 verifica per default il checksum dell'intero oggetto:
+        # con le Range request (download parziale) non puo' mai coincidere.
+        request_checksum_calculation="when_required",
+        response_checksum_validation="when_required",
     ),
 )
 
