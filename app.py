@@ -223,10 +223,14 @@ def _extract_era(tags, key):
   if tags is not None:
     for frame_id in YEAR_FRAMES:
       frame = tags.get(frame_id)
-      if frame is not None and getattr(frame, "text", None):
-        match = re.search(r"\d{4}", str(frame.text[0]))
-        if match:
-          return match.group(0)
+      if frame is not None:
+        try:
+          text_val = str(frame.text[0]) if getattr(frame, "text", None) else str(frame)
+          match = re.search(r"\b(19\d{2}|20\d{2})\b", text_val)
+          if match:
+            return match.group(0)
+        except Exception:
+          pass
   match = re.search(r"\b(19\d{2}|20\d{2})\b", key)  # ultimo tentativo: percorso
   return match.group(1) if match else "N/D"
 
@@ -236,12 +240,14 @@ def _extract_cover(tags):
     return None
   pictures = tags.getall("APIC")
   if not pictures:
+    pictures = [v for k, v in tags.items() if k.startswith("APIC")]
+  if not pictures:
     return None
-  picture = next((p for p in pictures if p.type == 3), pictures[0])  # 3 = front
-  data = picture.data
+  picture = next((p for p in pictures if getattr(p, "type", 3) in (3, 0, 2)), pictures[0])
+  data = getattr(picture, "data", None)
   if not data:
     return None
-  mime = (picture.mime or "").lower()
+  mime = (getattr(picture, "mime", "") or "").lower()
   if mime == "image/jpg":
     mime = "image/jpeg"
   if not mime.startswith("image/"):
