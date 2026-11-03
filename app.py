@@ -75,8 +75,8 @@ s3 = boto3.client(
     config=Config(
         signature_version="s3v4",
         retries={"max_attempts": 3, "mode": "standard"},
-        connect_timeout=5,
-        read_timeout=20,
+        connect_timeout=10,
+        read_timeout=45,
     ),
 )
 
@@ -250,7 +250,7 @@ def _extract_cover(tags):
 
 
 def load_track_info(key):
-  """Metadati di un brano (con cache). Solleva ClientError se R2 non risponde."""
+  """Metadati di un brano (con cache e fallback)."""
   with _lock:
     cached = _meta_cache.get(key)
   if cached is not None:
@@ -260,13 +260,20 @@ def load_track_info(key):
   album = parts[-2] if len(parts) > 1 else "Cloudflare R2"
   title = os.path.splitext(parts[-1])[0]
 
-  tags = _fetch_tags(key)
-  cover = _extract_cover(tags)
+  try:
+    tags = _fetch_tags(key)
+    cover = _extract_cover(tags)
+    era = _extract_era(tags, key)
+    has_cover = cover is not None
+  except Exception as exc:
+    log.warning("Lettura tag fallita per %s: %s", key, exc)
+    tags, cover, era, has_cover = None, None, "N/D", False
+
   info = {
       "title": title,
       "album": album,
-      "era": _extract_era(tags, key),
-      "has_cover": cover is not None,
+      "era": era,
+      "has_cover": has_cover,
   }
   with _lock:
     _meta_cache[key] = info
@@ -292,11 +299,15 @@ def get_cover(key):
     return entry
 
   # La copertina e' stata espulsa dalla cache LRU: la rileggo.
-  cover = _extract_cover(_fetch_tags(key))
-  if cover is not None:
-    with _lock:
-      _store_cover(key, cover)
-  return cover
+  try:
+    cover = _extract_cover(_fetch_tags(key))
+    if cover is not None:
+      with _lock:
+        _store_cover(key, cover)
+    return cover
+  except Exception as exc:
+    log.warning("Impossibile recuperare copertina per %s: %s", key, exc)
+    return None
 
 
 # ==================== SICUREZZA ====================
@@ -329,6 +340,14 @@ def _safe_load(key):
     load_track_info(key)
   except Exception as exc:
     log.warning("Pre-cache fallita per %s: %s", key, exc)
+    parts = key.split("/")
+    with _lock:
+      _meta_cache[key] = {
+          "title": os.path.splitext(parts[-1])[0],
+          "album": parts[-2] if len(parts) > 1 else "Cloudflare R2",
+          "era": "N/D",
+          "has_cover": False,
+      }
 
 
 def warm_up():
@@ -397,7 +416,6 @@ def api_metadata():
 
 @app.get("/cover")
 def cover():
-  # Pubblico (serve a Discord per la miniatura) ma solo per brani esistenti.
   key = request.args.get("file", "")
   if not key or not is_known(key):
     abort(404)
@@ -427,7 +445,6 @@ def download():
   if not key.lower().endswith(".mp3"):
     abort(403)
 
-  # Il download parte direttamente da R2: Render non trasporta il file.
   url = s3.generate_presigned_url(
       "get_object",
       Params={
