@@ -6,7 +6,8 @@ import time
 import uuid
 import boto3
 from flask import Flask, jsonify, request, send_file
-from mutagen.id3 import APIC, ID3
+from mutagen.easyid3 import EasyID3
+from mutagen.id3 import ID3
 from mutagen.mp3 import MP3
 
 app = Flask(__name__)
@@ -33,44 +34,34 @@ file_list_timestamp = 0
 CACHE_TTL = 3600  # 1 ora
 
 
-# FUNZIONE DI ESTRAZIONE ANNO/ERA TOTALE (Standard, TXXX e Path Fallback)
-def extract_era_from_audio(audio, file_key=""):
-  if audio and audio.tags:
-    # 1. Cerca nei tag standard (TDRC, TYER, DATE, YEAR, ecc.)
-    for tag_name in ["TDRC", "TYER", "TYE", "DATE", "YEAR", "TDAT", "TIME"]:
-      if tag_name in audio.tags:
-        try:
+# FUNZIONE DI ESTRAZIONE ANNO/ERA CON EASYID3 (Universale per qualsiasi ID3v2.3, v2.4 o v1)
+def extract_era_from_audio(tmp_path, file_key=""):
+  # 1. Tentativo con EasyID3 (gestisce automaticamente la normalizzazione dei tag anno/data)
+  try:
+    audio_easy = EasyID3(tmp_path)
+    for tag_key in ["date", "year"]:
+      if tag_key in audio_easy:
+        val = str(audio_easy[tag_key][0])
+        match = re.search(r"\d{4}", val)
+        if match:
+          return match.group(0)
+  except Exception:
+    pass
+
+  # 2. Tentativo di fallback con ID3 grezzo (per tag non standard o custom)
+  try:
+    audio = MP3(tmp_path, ID3=ID3)
+    if audio.tags:
+      for tag_name in ["TDRC", "TYER", "TYE", "DATE", "YEAR", "TDAT", "TIME"]:
+        if tag_name in audio.tags:
           val = str(audio.tags[tag_name].text[0])
           match = re.search(r"\d{4}", val)
           if match:
             return match.group(0)
-        except:
-          pass
+  except Exception:
+    pass
 
-    # 2. Cerca nei tag personalizzati TXXX (comuni nei file custom/unreleased)
-    for key, frame in audio.tags.items():
-      if key.startswith("TXXX"):
-        try:
-          text_val = " ".join([str(t) for t in frame.text])
-          match = re.search(r"\b(19\d{2}|20\d{2})\b", text_val)
-          if match:
-            return match.group(1)
-        except:
-          pass
-
-    # 3. Scansione generica di qualsiasi frame testuale (inizializzato per 'T')
-    for key, frame in audio.tags.items():
-      if key.startswith("T"):
-        try:
-          if hasattr(frame, "text") and frame.text:
-            text_val = " ".join([str(t) for t in frame.text])
-            match = re.search(r"\b(19\d{2}|20\d{2})\b", text_val)
-            if match:
-              return match.group(1)
-        except:
-          pass
-
-  # 4. Fallback estremo: cerca l'anno direttamente nel percorso/nome del file
+  # 3. Fallback estremo: cerca l'anno nel percorso del file
   if file_key:
     match = re.search(r"\b(19\d{2}|20\d{2})\b", file_key)
     if match:
@@ -113,7 +104,7 @@ def warm_up_cache():
         filename = parts[-1]
         title = os.path.splitext(filename)[0]
 
-        era_str = extract_era_from_audio(audio, file_key)
+        era_str = extract_era_from_audio(tmp_path, file_key)
 
         has_cover = False
         cover_data = None
@@ -153,7 +144,7 @@ threading.Thread(target=warm_up_cache, daemon=True).start()
 
 @app.route("/")
 def home():
-  return "Audio Bot Proxy Server is running 24/7!"
+  return "Audio Bot Proxy Server is running 24/7 (EasyID3 Enabled)!"
 
 
 @app.route("/api/list")
@@ -197,7 +188,7 @@ def api_metadata():
     filename = parts[-1]
     title = os.path.splitext(filename)[0]
 
-    era_str = extract_era_from_audio(audio, file_key)
+    era_str = extract_era_from_audio(tmp_path, file_key)
 
     has_cover = False
     cover_data = None
@@ -222,7 +213,6 @@ def api_metadata():
         "has_cover": has_cover,
     }
 
-    # Memorizza in cache solo se ha trovato un valore valido o aggiornato
     metadata_cache[file_key] = result
     return jsonify(result)
   except Exception as e:
