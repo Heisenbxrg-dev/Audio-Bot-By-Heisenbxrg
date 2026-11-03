@@ -33,7 +33,38 @@ file_list_timestamp = 0
 CACHE_TTL = 3600  # 1 ora
 
 
-# FUNZIONE DI PRE-CACHING TOTALE CON ESTRAZIONE UNIVERSALE DELL'ERA
+# FUNZIONE DI ESTRAZIONE ANNO/ERA SUPER SICURA
+def extract_era_from_audio(audio):
+  if not audio.tags:
+    return "N/D"
+
+  # 1. Tentativo diretto sui tag standard degli anni (TDRC = ID3v2.4, TYER = ID3v2.3)
+  for tag_name in ["TDRC", "TYER", "TYE", "DATE", "YEAR"]:
+    if tag_name in audio.tags:
+      try:
+        val = str(audio.tags[tag_name].text[0])
+        match = re.search(r"\d{4}", val)
+        if match:
+          return match.group(0)
+      except:
+        pass
+
+  # 2. Tentativo di scansione universale su qualsiasi cornice testuale
+  for key, frame in audio.tags.items():
+    if key.startswith("T"):  # Tutti i text frames in ID3 iniziano per T
+      try:
+        if hasattr(frame, "text") and frame.text:
+          val = str(frame.text[0])
+          match = re.search(r"\b(19\d{2}|20\d{2})\b", val)
+          if match:
+            return match.group(1)
+      except:
+        pass
+
+  return "N/D"
+
+
+# FUNZIONE DI PRE-CACHING TOTALE
 def warm_up_cache():
   global file_list_cache, file_list_timestamp
   print("🔄 [Warm-up] Avvio scansione e pre-caricamento totale da R2...")
@@ -67,22 +98,7 @@ def warm_up_cache():
         filename = parts[-1]
         title = os.path.splitext(filename)[0]
 
-        # Estrazione Universale Anno / Era da qualsiasi tag
-        era_str = "N/D"
-        if audio.tags:
-          for key, frame in audio.tags.items():
-            try:
-              if hasattr(frame, "text") and frame.text:
-                text_val = " ".join([str(t) for t in frame.text])
-              else:
-                text_val = str(frame)
-
-              match = re.search(r"\b(19\d{2}|20\d{2})\b", text_val)
-              if match:
-                era_str = match.group(1)
-                break
-            except:
-              pass
+        era_str = extract_era_from_audio(audio)
 
         has_cover = False
         cover_data = None
@@ -112,42 +128,37 @@ def warm_up_cache():
         if os.path.exists(tmp_path):
           os.remove(tmp_path)
 
-    print("🚀 [Warm-up] Pre-caricamento completato! Server fulmineo e pronto.")
+    print("🚀 [Warm-up] Pre-caricamento completato!")
   except Exception as e:
     print(f"❌ Errore durante il warm-up: {e}")
 
 
-# Avvia il riscaldamento in un thread separato
 threading.Thread(target=warm_up_cache, daemon=True).start()
 
 
 @app.route("/")
 def home():
-  return "Audio Bot Proxy Server is running 24/7 (Universal Metadata Search)!"
+  return "Audio Bot Proxy Server is running 24/7!"
 
 
 @app.route("/api/list")
 def api_list():
   global file_list_cache, file_list_timestamp
-
   if file_list_cache is None or len(file_list_cache) == 0:
     try:
       files = []
       paginator = s3_client.get_paginator("list_objects_v2")
       page_iterator = paginator.paginate(Bucket=R2_BUCKET_NAME)
-
       for page in page_iterator:
         if "Contents" in page:
           for obj in page["Contents"]:
             key = obj["Key"]
             if key.lower().endswith(".mp3"):
               files.append(key)
-
       file_list_cache = files
       file_list_timestamp = time.time()
     except Exception as e:
       print(f"⚠️ Errore recupero lista R2: {e}")
-
   return jsonify(file_list_cache if file_list_cache is not None else [])
 
 
@@ -170,22 +181,7 @@ def api_metadata():
     filename = parts[-1]
     title = os.path.splitext(filename)[0]
 
-    # Estrazione Universale Anno / Era da qualsiasi tag
-    era_str = "N/D"
-    if audio.tags:
-      for key, frame in audio.tags.items():
-        try:
-          if hasattr(frame, "text") and frame.text:
-            text_val = " ".join([str(t) for t in frame.text])
-          else:
-            text_val = str(frame)
-
-          match = re.search(r"\b(19\d{2}|20\d{2})\b", text_val)
-          if match:
-            era_str = match.group(1)
-            break
-        except:
-          pass
+    era_str = extract_era_from_audio(audio)
 
     has_cover = False
     cover_data = None
@@ -243,7 +239,6 @@ def get_cover():
   try:
     s3_client.download_file(R2_BUCKET_NAME, file_key, tmp_path)
     audio = MP3(tmp_path, ID3=ID3)
-
     cover_data = None
     mime_type = "image/jpeg"
 
