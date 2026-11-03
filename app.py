@@ -33,33 +33,48 @@ file_list_timestamp = 0
 CACHE_TTL = 3600  # 1 ora
 
 
-# FUNZIONE DI ESTRAZIONE ANNO/ERA SUPER SICURA
-def extract_era_from_audio(audio):
-  if not audio.tags:
-    return "N/D"
+# FUNZIONE DI ESTRAZIONE ANNO/ERA TOTALE (Standard, TXXX e Path Fallback)
+def extract_era_from_audio(audio, file_key=""):
+  if audio and audio.tags:
+    # 1. Cerca nei tag standard (TDRC, TYER, DATE, YEAR, ecc.)
+    for tag_name in ["TDRC", "TYER", "TYE", "DATE", "YEAR", "TDAT", "TIME"]:
+      if tag_name in audio.tags:
+        try:
+          val = str(audio.tags[tag_name].text[0])
+          match = re.search(r"\d{4}", val)
+          if match:
+            return match.group(0)
+        except:
+          pass
 
-  # 1. Tentativo diretto sui tag standard degli anni (TDRC = ID3v2.4, TYER = ID3v2.3)
-  for tag_name in ["TDRC", "TYER", "TYE", "DATE", "YEAR"]:
-    if tag_name in audio.tags:
-      try:
-        val = str(audio.tags[tag_name].text[0])
-        match = re.search(r"\d{4}", val)
-        if match:
-          return match.group(0)
-      except:
-        pass
-
-  # 2. Tentativo di scansione universale su qualsiasi cornice testuale
-  for key, frame in audio.tags.items():
-    if key.startswith("T"):  # Tutti i text frames in ID3 iniziano per T
-      try:
-        if hasattr(frame, "text") and frame.text:
-          val = str(frame.text[0])
-          match = re.search(r"\b(19\d{2}|20\d{2})\b", val)
+    # 2. Cerca nei tag personalizzati TXXX (comuni nei file custom/unreleased)
+    for key, frame in audio.tags.items():
+      if key.startswith("TXXX"):
+        try:
+          text_val = " ".join([str(t) for t in frame.text])
+          match = re.search(r"\b(19\d{2}|20\d{2})\b", text_val)
           if match:
             return match.group(1)
-      except:
-        pass
+        except:
+          pass
+
+    # 3. Scansione generica di qualsiasi frame testuale (inizializzato per 'T')
+    for key, frame in audio.tags.items():
+      if key.startswith("T"):
+        try:
+          if hasattr(frame, "text") and frame.text:
+            text_val = " ".join([str(t) for t in frame.text])
+            match = re.search(r"\b(19\d{2}|20\d{2})\b", text_val)
+            if match:
+              return match.group(1)
+        except:
+          pass
+
+  # 4. Fallback estremo: cerca l'anno direttamente nel percorso/nome del file
+  if file_key:
+    match = re.search(r"\b(19\d{2}|20\d{2})\b", file_key)
+    if match:
+      return match.group(1)
 
   return "N/D"
 
@@ -98,7 +113,7 @@ def warm_up_cache():
         filename = parts[-1]
         title = os.path.splitext(filename)[0]
 
-        era_str = extract_era_from_audio(audio)
+        era_str = extract_era_from_audio(audio, file_key)
 
         has_cover = False
         cover_data = None
@@ -168,7 +183,8 @@ def api_metadata():
   if not file_key:
     return jsonify({"error": "File non specificato"}), 400
 
-  if file_key in metadata_cache:
+  # Se è in cache e non è "N/D", restituisce subito
+  if file_key in metadata_cache and metadata_cache[file_key].get("era") != "N/D":
     return jsonify(metadata_cache[file_key])
 
   tmp_path = f"temp_meta_{uuid.uuid4()}.mp3"
@@ -181,7 +197,7 @@ def api_metadata():
     filename = parts[-1]
     title = os.path.splitext(filename)[0]
 
-    era_str = extract_era_from_audio(audio)
+    era_str = extract_era_from_audio(audio, file_key)
 
     has_cover = False
     cover_data = None
@@ -206,6 +222,7 @@ def api_metadata():
         "has_cover": has_cover,
     }
 
+    # Memorizza in cache solo se ha trovato un valore valido o aggiornato
     metadata_cache[file_key] = result
     return jsonify(result)
   except Exception as e:
