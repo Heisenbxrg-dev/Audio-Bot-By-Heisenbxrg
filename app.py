@@ -75,8 +75,8 @@ s3 = boto3.client(
     config=Config(
         signature_version="s3v4",
         retries={"max_attempts": 3, "mode": "standard"},
-        connect_timeout=10,
-        read_timeout=45,
+        connect_timeout=5,
+        read_timeout=20,
     ),
 )
 
@@ -223,14 +223,10 @@ def _extract_era(tags, key):
   if tags is not None:
     for frame_id in YEAR_FRAMES:
       frame = tags.get(frame_id)
-      if frame is not None:
-        try:
-          text_val = str(frame.text[0]) if getattr(frame, "text", None) else str(frame)
-          match = re.search(r"\b(19\d{2}|20\d{2})\b", text_val)
-          if match:
-            return match.group(0)
-        except Exception:
-          pass
+      if frame is not None and getattr(frame, "text", None):
+        match = re.search(r"\d{4}", str(frame.text[0]))
+        if match:
+          return match.group(0)
   match = re.search(r"\b(19\d{2}|20\d{2})\b", key)  # ultimo tentativo: percorso
   return match.group(1) if match else "N/D"
 
@@ -240,14 +236,12 @@ def _extract_cover(tags):
     return None
   pictures = tags.getall("APIC")
   if not pictures:
-    pictures = [v for k, v in tags.items() if k.startswith("APIC")]
-  if not pictures:
     return None
-  picture = next((p for p in pictures if getattr(p, "type", 3) in (3, 0, 2)), pictures[0])
-  data = getattr(picture, "data", None)
+  picture = next((p for p in pictures if p.type == 3), pictures[0])  # 3 = front
+  data = picture.data
   if not data:
     return None
-  mime = (getattr(picture, "mime", "") or "").lower()
+  mime = (picture.mime or "").lower()
   if mime == "image/jpg":
     mime = "image/jpeg"
   if not mime.startswith("image/"):
@@ -256,7 +250,7 @@ def _extract_cover(tags):
 
 
 def load_track_info(key):
-  """Metadati di un brano (con cache e fallback)."""
+  """Metadati di un brano (con cache). Solleva ClientError se R2 non risponde."""
   with _lock:
     cached = _meta_cache.get(key)
   if cached is not None:
@@ -266,20 +260,13 @@ def load_track_info(key):
   album = parts[-2] if len(parts) > 1 else "Cloudflare R2"
   title = os.path.splitext(parts[-1])[0]
 
-  try:
-    tags = _fetch_tags(key)
-    cover = _extract_cover(tags)
-    era = _extract_era(tags, key)
-    has_cover = cover is not None
-  except Exception as exc:
-    log.warning("Lettura tag fallita per %s: %s", key, exc)
-    tags, cover, era, has_cover = None, None, "N/D", False
-
+  tags = _fetch_tags(key)
+  cover = _extract_cover(tags)
   info = {
       "title": title,
       "album": album,
-      "era": era,
-      "has_cover": has_cover,
+      "era": _extract_era(tags, key),
+      "has_cover": cover is not None,
   }
   with _lock:
     _meta_cache[key] = info
@@ -305,15 +292,11 @@ def get_cover(key):
     return entry
 
   # La copertina e' stata espulsa dalla cache LRU: la rileggo.
-  try:
-    cover = _extract_cover(_fetch_tags(key))
-    if cover is not None:
-      with _lock:
-        _store_cover(key, cover)
-    return cover
-  except Exception as exc:
-    log.warning("Impossibile recuperare copertina per %s: %s", key, exc)
-    return None
+  cover = _extract_cover(_fetch_tags(key))
+  if cover is not None:
+    with _lock:
+      _store_cover(key, cover)
+  return cover
 
 
 # ==================== SICUREZZA ====================
@@ -346,14 +329,6 @@ def _safe_load(key):
     load_track_info(key)
   except Exception as exc:
     log.warning("Pre-cache fallita per %s: %s", key, exc)
-    parts = key.split("/")
-    with _lock:
-      _meta_cache[key] = {
-          "title": os.path.splitext(parts[-1])[0],
-          "album": parts[-2] if len(parts) > 1 else "Cloudflare R2",
-          "era": "N/D",
-          "has_cover": False,
-      }
 
 
 def warm_up():
@@ -422,6 +397,7 @@ def api_metadata():
 
 @app.get("/cover")
 def cover():
+  # Pubblico (serve a Discord per la miniatura) ma solo per brani esistenti.
   key = request.args.get("file", "")
   if not key or not is_known(key):
     abort(404)
@@ -451,6 +427,7 @@ def download():
   if not key.lower().endswith(".mp3"):
     abort(403)
 
+  # Il download parte direttamente da R2: Render non trasporta il file.
   url = s3.generate_presigned_url(
       "get_object",
       Params={
