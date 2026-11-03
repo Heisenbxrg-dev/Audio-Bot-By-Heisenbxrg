@@ -27,14 +27,17 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, urlencode
-
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, abort, jsonify, redirect, request, send_file
 from mutagen.id3 import ID3
 from werkzeug.middleware.proxy_fix import ProxyFix
-
+try:
+  from dotenv import load_dotenv
+  load_dotenv()
+except ImportError:
+  pass
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
