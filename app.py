@@ -33,7 +33,7 @@ file_list_timestamp = 0
 CACHE_TTL = 3600  # 1 ora
 
 
-# FUNZIONE DI PRE-CACHING TOTALE CON ESTRAZIONE ROBUSTA DELL'ERA
+# FUNZIONE DI PRE-CACHING TOTALE CON ESTRAZIONE UNIVERSALE DELL'ERA
 def warm_up_cache():
   global file_list_cache, file_list_timestamp
   print("🔄 [Warm-up] Avvio scansione e pre-caricamento totale da R2...")
@@ -67,27 +67,22 @@ def warm_up_cache():
         filename = parts[-1]
         title = os.path.splitext(filename)[0]
 
-        # Estrazione Era / Anno ultra-robusta con Regex
+        # Estrazione Universale Anno / Era da qualsiasi tag
         era_str = "N/D"
         if audio.tags:
-          for tag_key in audio.tags.keys():
-            if any(
-                k in tag_key.upper()
-                for k in ["TDRC", "TYER", "TYE", "DATE", "YEAR"]
-            ):
-              try:
-                tag_obj = audio.tags[tag_key]
-                if hasattr(tag_obj, "text") and tag_obj.text:
-                  val = str(tag_obj.text[0])
-                else:
-                  val = str(tag_obj)
+          for key, frame in audio.tags.items():
+            try:
+              if hasattr(frame, "text") and frame.text:
+                text_val = " ".join([str(t) for t in frame.text])
+              else:
+                text_val = str(frame)
 
-                match = re.search(r"\d{4}", val)
-                if match:
-                  era_str = match.group(0)
-                  break
-              except:
-                pass
+              match = re.search(r"\b(19\d{2}|20\d{2})\b", text_val)
+              if match:
+                era_str = match.group(1)
+                break
+            except:
+              pass
 
         has_cover = False
         cover_data = None
@@ -128,7 +123,7 @@ threading.Thread(target=warm_up_cache, daemon=True).start()
 
 @app.route("/")
 def home():
-  return "Audio Bot Proxy Server is running 24/7 (Robust Metadata & Era)!"
+  return "Audio Bot Proxy Server is running 24/7 (Universal Metadata Search)!"
 
 
 @app.route("/api/list")
@@ -175,26 +170,22 @@ def api_metadata():
     filename = parts[-1]
     title = os.path.splitext(filename)[0]
 
-    # Estrazione Era / Anno ultra-robusta con Regex
+    # Estrazione Universale Anno / Era da qualsiasi tag
     era_str = "N/D"
     if audio.tags:
-      for tag_key in audio.tags.keys():
-        if any(
-            k in tag_key.upper() for k in ["TDRC", "TYER", "TYE", "DATE", "YEAR"]
-        ):
-          try:
-            tag_obj = audio.tags[tag_key]
-            if hasattr(tag_obj, "text") and tag_obj.text:
-              val = str(tag_obj.text[0])
-            else:
-              val = str(tag_obj)
+      for key, frame in audio.tags.items():
+        try:
+          if hasattr(frame, "text") and frame.text:
+            text_val = " ".join([str(t) for t in frame.text])
+          else:
+            text_val = str(frame)
 
-            match = re.search(r"\d{4}", val)
-            if match:
-              era_str = match.group(0)
-              break
-          except:
-            pass
+          match = re.search(r"\b(19\d{2}|20\d{2})\b", text_val)
+          if match:
+            era_str = match.group(1)
+            break
+        except:
+          pass
 
     has_cover = False
     cover_data = None
