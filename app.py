@@ -235,22 +235,41 @@ def _extract_era(tags, key):
   return match.group(1) if match else "N/D"
 
 
+def _extract_artist(tags):
+  if tags is not None:
+    frame = tags.get("TPE1")
+    if frame is not None and getattr(frame, "text", None):
+      artist = str(frame.text[0]).strip()
+      if artist:
+        return artist
+  return None
+
+
+def _extract_duration(tags):
+  if tags is not None:
+    frame = tags.get("TLEN")
+    if frame is not None and getattr(frame, "text", None):
+      try:
+        return float(frame.text[0]) / 1000.0
+      except (ValueError, TypeError):
+        pass
+  return None
+
+
 def _extract_cover(tags):
-  if tags is None:
-    return None
-  pictures = tags.getall("APIC")
-  if not pictures:
-    return None
-  picture = next((p for p in pictures if p.type == 3), pictures[0])  # 3 = front
-  data = picture.data
-  if not data:
-    return None
-  mime = (picture.mime or "").lower()
-  if mime == "image/jpg":
-    mime = "image/jpeg"
-  if not mime.startswith("image/"):
-    mime = "image/png" if data.startswith(b"\x89PNG") else "image/jpeg"
-  return data, mime
+  if tags is not None:
+    pictures = tags.getall("APIC")
+    if pictures:
+      picture = next((p for p in pictures if p.type == 3), pictures[0])  # 3 = front
+      data = picture.data
+      if data:
+        mime = (picture.mime or "").lower()
+        if mime == "image/jpg":
+          mime = "image/jpeg"
+        if not mime.startswith("image/"):
+          mime = "image/png" if data.startswith(b"\x89PNG") else "image/jpeg"
+        return data, mime
+  return None
 
 
 def load_track_info(key):
@@ -269,6 +288,8 @@ def load_track_info(key):
   info = {
       "title": title,
       "album": album,
+      "artist": _extract_artist(tags),
+      "duration": _extract_duration(tags),
       "era": _extract_era(tags, key),
       "has_cover": cover is not None,
   }
