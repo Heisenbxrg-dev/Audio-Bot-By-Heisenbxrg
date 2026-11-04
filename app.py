@@ -33,6 +33,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, abort, jsonify, redirect, request, send_file
 from mutagen.id3 import ID3
+from mutagen.mp3 import MP3
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 logging.basicConfig(
@@ -77,15 +78,12 @@ s3 = boto3.client(
         retries={"max_attempts": 3, "mode": "standard"},
         connect_timeout=5,
         read_timeout=20,
-        # boto3 >= 1.36 verifica per default il checksum dell'intero oggetto:
-        # con le Range request (download parziale) non puo' mai coincidere.
         request_checksum_calculation="when_required",
         response_checksum_validation="when_required",
     ),
 )
 
 app = Flask(__name__)
-# Render sta dietro un proxy: serve per avere https negli URL generati.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 for _code, _text in (
@@ -159,15 +157,15 @@ def get_file_list(force=False):
   except (ClientError, BotoCoreError) as exc:
     log.warning("Errore lettura lista da R2: %s", exc)
     with _lock:
-      return list(_file_list)  # meglio una lista vecchia che nessuna lista
+      return list(_file_list)
 
   with _lock:
     for key, etag in index.items():
       previous = _file_index.get(key)
       if previous is not None and previous != etag:
-        _drop_cache(key)  # file sostituito: rilegge i tag
+        _drop_cache(key)
     for key in set(_file_index) - set(index):
-      _drop_cache(key)  # file rimosso
+      _drop_cache(key)
     _file_index = index
     _file_list = sorted(index, key=str.lower)
     _list_ts = time.time()
@@ -180,16 +178,15 @@ def is_known(key):
     return key in _file_index
 
 
-# ==================== LETTURA TAG ID3 (solo l'inizio del file) ====================
+# ==================== LETTURA TAG ID3 E AUDIO ====================
 def _fetch_id3_bytes(key):
-  """Scarica SOLO il tag ID3 (Range request) invece dell'mp3 intero."""
   try:
     resp = s3.get_object(
         Bucket=R2_BUCKET_NAME, Key=key, Range=f"bytes=0-{INITIAL_RANGE - 1}"
     )
   except ClientError as exc:
     if exc.response.get("Error", {}).get("Code") == "InvalidRange":
-      return None  # file vuoto
+      return None
     raise
   data = resp["Body"].read()
   if len(data) < 10 or data[:3] != b"ID3":
@@ -201,7 +198,7 @@ def _fetch_id3_bytes(key):
       | ((data[8] & 0x7F) << 7)
       | (data[9] & 0x7F)
   )
-  total = 10 + size + (10 if data[5] & 0x10 else 0)  # header + corpo + footer
+  total = 10 + size + (10 if data[5] & 0x10 else 0)
   if total > MAX_ID3_BYTES:
     return None
   if total > len(data) and len(data) >= INITIAL_RANGE:
@@ -218,7 +215,7 @@ def _fetch_tags(key):
     return None
   try:
     return ID3(raw)
-  except Exception as exc:  # tag corrotto o non standard
+  except Exception as exc:
     log.debug("Tag ID3 illeggibili per %s: %s", key, exc)
     return None
 
@@ -231,7 +228,7 @@ def _extract_era(tags, key):
         match = re.search(r"\d{4}", str(frame.text[0]))
         if match:
           return match.group(0)
-  match = re.search(r"\b(19\d{2}|20\d{2})\b", key)  # ultimo tentativo: percorso
+  match = re.search(r"\b(19\d{2}|20\d{2})\b", key)
   return match.group(1) if match else "N/D"
 
 
@@ -245,14 +242,28 @@ def _extract_artist(tags):
   return None
 
 
-def _extract_duration(tags):
+def _extract_duration(tags, key):
+  # 1. Tenta di leggere dal tag ID3 TLEN (durata in millisecondi)
   if tags is not None:
     frame = tags.get("TLEN")
     if frame is not None and getattr(frame, "text", None):
       try:
-        return float(frame.text[0]) / 1000.0
+        val = float(str(frame.text[0]).strip())
+        if val > 0:
+          return val / 1000.0
       except (ValueError, TypeError):
         pass
+
+  # 2. Se TLEN non è presente o non valido, scarica una porzione iniziale più ampia o usa mutagen.mp3 sull'oggetto stream
+  try:
+    resp = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key, Range="bytes=0-512000")
+    audio_data = io.BytesIO(resp["Body"].read())
+    audio = MP3(audio_data)
+    if audio.info and audio.info.length:
+      return float(audio.info.length)
+  except Exception as exc:
+    log.debug("Impossibile calcolare la durata da MP3 stream per %s: %s", key, exc)
+
   return None
 
 
@@ -260,7 +271,7 @@ def _extract_cover(tags):
   if tags is not None:
     pictures = tags.getall("APIC")
     if pictures:
-      picture = next((p for p in pictures if p.type == 3), pictures[0])  # 3 = front
+      picture = next((p for p in pictures if p.type == 3), pictures[0])
       data = picture.data
       if data:
         mime = (picture.mime or "").lower()
@@ -289,7 +300,7 @@ def load_track_info(key):
       "title": title,
       "album": album,
       "artist": _extract_artist(tags),
-      "duration": _extract_duration(tags),
+      "duration": _extract_duration(tags, key),
       "era": _extract_era(tags, key),
       "has_cover": cover is not None,
   }
@@ -316,7 +327,6 @@ def get_cover(key):
   if entry is not None:
     return entry
 
-  # La copertina e' stata espulsa dalla cache LRU: la rileggo.
   cover = _extract_cover(_fetch_tags(key))
   if cover is not None:
     with _lock:
@@ -422,7 +432,6 @@ def api_metadata():
 
 @app.get("/cover")
 def cover():
-  # Pubblico (serve a Discord per la miniatura) ma solo per brani esistenti.
   key = request.args.get("file", "")
   if not key or not is_known(key):
     abort(404)
@@ -452,7 +461,6 @@ def download():
   if not key.lower().endswith(".mp3"):
     abort(403)
 
-  # Il download parte direttamente da R2: Render non trasporta il file.
   url = s3.generate_presigned_url(
       "get_object",
       Params={
