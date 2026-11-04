@@ -28,6 +28,11 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, urlencode
 
+try:
+  import resource  # solo Linux/macOS
+except ImportError:
+  resource = None
+
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
@@ -67,11 +72,10 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 LINK_TTL = int(os.environ.get("LINK_TTL", "86400"))  # validita' link download
 
 LIST_TTL = 300  # secondi prima di rileggere la lista da R2
-INITIAL_RANGE = 256 * 1024  # primi byte letti per trovare il tag ID3
 AUDIO_PROBE = 64 * 1024  # byte di audio letti dopo il tag per stimare la durata
-MAX_ID3_BYTES = 20 * 1024 * 1024  # tag piu' grandi vengono ignorati
-COVER_CACHE_MAX_BYTES = 64 * 1024 * 1024  # tetto RAM per le copertine
-WARMUP_WORKERS = 4
+MAX_ID3_BYTES = 12 * 1024 * 1024  # tag piu' grandi vengono ignorati (evita picchi di RAM)
+COVER_CACHE_MAX_BYTES = 32 * 1024 * 1024  # tetto RAM per le copertine
+WARMUP_WORKERS = 2  # pochi thread: ogni tag con copertina pesa in RAM
 DOWNLOAD_URL_TTL = 300  # validita' dell'URL presigned verso R2 (secondi)
 YEAR_FRAMES = ("TDRC", "TYER", "TDRL", "TDOR", "TORY")
 
@@ -139,6 +143,27 @@ def _store_cover(key, cover):
   while _cover_bytes > COVER_CACHE_MAX_BYTES and _cover_cache:
     _, (evicted, _) = _cover_cache.popitem(last=False)
     _cover_bytes -= len(evicted)
+
+
+def rss_mb():
+  """Picco di memoria del processo in MB (0 se non disponibile)."""
+  if resource is None:
+    return 0.0
+  return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+def fallback_info(key):
+  """Dati ricavati dal solo percorso: usati se i tag non si possono leggere."""
+  parts = key.split("/")
+  match = re.search(r"\b(19\d{2}|20\d{2})\b", key)
+  return {
+      "title": os.path.splitext(parts[-1])[0],
+      "artist": None,
+      "album": parts[-2] if len(parts) > 1 else "Cloudflare R2",
+      "era": match.group(1) if match else None,
+      "duration": None,
+      "has_cover": False,
+  }
 
 
 def is_missing(exc):
@@ -214,46 +239,52 @@ def _estimate_duration(audio, tag_len, total_size):
   return None
 
 
+def _get_range(key, start, end):
+  return s3.get_object(
+      Bucket=R2_BUCKET_NAME, Key=key, Range=f"bytes={start}-{end}"
+  )["Body"].read()
+
+
 def _read_head(key):
-  """Legge SOLO l'inizio del file (Range request). Ritorna (tag ID3|None, durata|None)."""
+  """Legge SOLO l'inizio del file (Range request). Ritorna (tag ID3|None, durata|None).
+
+  Prima 10 byte per sapere quanto e' grande il tag, poi tag + un po' di audio in
+  un'unica richiesta: i dati vengono copiati il meno possibile (risparmio di RAM).
+  """
   try:
-    resp = s3.get_object(
-        Bucket=R2_BUCKET_NAME, Key=key, Range=f"bytes=0-{INITIAL_RANGE - 1}"
-    )
+    resp = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key, Range="bytes=0-9")
   except ClientError as exc:
     if exc.response.get("Error", {}).get("Code") == "InvalidRange":
       return None, None  # file vuoto
     raise
-  data = resp["Body"].read()
-  total_size = _total_size(resp, len(data))
+  head = resp["Body"].read()
+  total_size = _total_size(resp, len(head))
 
   tag_len = 0
-  if len(data) >= 10 and data[:3] == b"ID3":
+  if len(head) >= 10 and head[:3] == b"ID3":
     size = (
-        ((data[6] & 0x7F) << 21)
-        | ((data[7] & 0x7F) << 14)
-        | ((data[8] & 0x7F) << 7)
-        | (data[9] & 0x7F)
+        ((head[6] & 0x7F) << 21)
+        | ((head[7] & 0x7F) << 14)
+        | ((head[8] & 0x7F) << 7)
+        | (head[9] & 0x7F)
     )
-    tag_len = 10 + size + (10 if data[5] & 0x10 else 0)  # header + corpo + footer
-    if tag_len > MAX_ID3_BYTES:
-      return None, None  # tag anomalo
-
-  # Completa il tag (se piu' grande del primo blocco) e legge un po' di audio.
-  wanted = tag_len + AUDIO_PROBE
-  if len(data) < wanted and len(data) < total_size:
-    end = min(wanted, total_size) - 1
-    data += s3.get_object(
-        Bucket=R2_BUCKET_NAME, Key=key, Range=f"bytes={len(data)}-{end}"
-    )["Body"].read()
+    tag_len = 10 + size + (10 if head[5] & 0x10 else 0)  # header + corpo + footer
 
   tags = None
-  if tag_len:
+  if 0 < tag_len <= MAX_ID3_BYTES and tag_len < total_size:
+    data = _get_range(key, 0, min(tag_len + AUDIO_PROBE, total_size) - 1)
     try:
-      tags = ID3(io.BytesIO(data[:tag_len]))
+      tags = ID3(io.BytesIO(data))  # mutagen legge solo tag_len byte
     except Exception as exc:  # tag corrotto o non standard
       log.debug("Tag ID3 illeggibili per %s: %s", key, exc)
-  return tags, _estimate_duration(data[tag_len:], tag_len, total_size)
+    audio = data[tag_len:]
+    del data
+  elif tag_len < total_size:
+    # nessun tag, oppure tag troppo grande da leggere: salto direttamente all'audio
+    audio = _get_range(key, tag_len, min(tag_len + AUDIO_PROBE, total_size) - 1)
+  else:
+    audio = b""
+  return tags, _estimate_duration(audio, tag_len, total_size)
 
 
 def _extract_era(tags, key):
@@ -298,8 +329,11 @@ def _extract_cover(tags):
   return data, mime
 
 
-def load_track_info(key):
-  """Metadati di un brano (con cache). Solleva ClientError se R2 non risponde."""
+def load_track_info(key, keep_cover=True):
+  """Metadati di un brano (con cache). Solleva ClientError se R2 non risponde.
+
+  Con keep_cover=False la copertina non resta in RAM (usato dal warm-up).
+  """
   with _lock:
     cached = _meta_cache.get(key)
   if cached is not None:
@@ -321,7 +355,7 @@ def load_track_info(key):
   }
   with _lock:
     _meta_cache[key] = info
-    if cover is not None:
+    if cover is not None and keep_cover:
       _store_cover(key, cover)
   return info
 
@@ -377,7 +411,7 @@ def content_disposition(filename):
 # ==================== PRE-CARICAMENTO ====================
 def _safe_load(key):
   try:
-    load_track_info(key)
+    load_track_info(key, keep_cover=False)
   except Exception as exc:
     log.warning("Pre-cache fallita per %s: %s", key, exc)
 
@@ -388,7 +422,7 @@ def warm_up():
     log.info("Warm-up: %d brani, lettura tag in corso", len(keys))
     with ThreadPoolExecutor(max_workers=WARMUP_WORKERS) as pool:
       list(pool.map(_safe_load, keys))
-    log.info("Warm-up completato")
+    log.info("Warm-up completato (picco RAM: %.0f MB)", rss_mb())
   except Exception:
     log.exception("Errore durante il warm-up")
 
@@ -420,6 +454,19 @@ def api_list():
   return jsonify(get_file_list(force=request.args.get("refresh") == "1"))
 
 
+@app.get("/api/stats")
+def api_stats():
+  require_bot_key()
+  with _lock:
+    return jsonify({
+        "tracks": len(_file_list),
+        "metadata_cached": len(_meta_cache),
+        "covers_cached": len(_cover_cache),
+        "covers_mb": round(_cover_bytes / 1024 / 1024, 1),
+        "peak_rss_mb": round(rss_mb()),
+    })
+
+
 @app.get("/api/metadata")
 def api_metadata():
   require_bot_key()
@@ -432,7 +479,10 @@ def api_metadata():
     if is_missing(exc):
       abort(404)
     log.warning("Errore metadati per %s: %s", key, exc)
-    abort(502)
+    info = fallback_info(key)  # il link di download funziona comunque
+  except Exception:
+    log.exception("Errore imprevisto nei metadati di %s", key)
+    info = fallback_info(key)
 
   expires_at = int(time.time()) + LINK_TTL
   query = urlencode(
