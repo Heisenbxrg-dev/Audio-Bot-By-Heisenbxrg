@@ -36,6 +36,13 @@ from mutagen.id3 import ID3
 from mutagen.mp3 import MP3
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+try:  # carica il file .env se presente (in locale); su Render non serve
+  from dotenv import load_dotenv
+
+  load_dotenv()
+except ImportError:
+  pass
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
@@ -61,6 +68,7 @@ LINK_TTL = int(os.environ.get("LINK_TTL", "86400"))  # validita' link download
 
 LIST_TTL = 300  # secondi prima di rileggere la lista da R2
 INITIAL_RANGE = 256 * 1024  # primi byte letti per trovare il tag ID3
+AUDIO_PROBE = 64 * 1024  # byte di audio letti dopo il tag per stimare la durata
 MAX_ID3_BYTES = 20 * 1024 * 1024  # tag piu' grandi vengono ignorati
 COVER_CACHE_MAX_BYTES = 64 * 1024 * 1024  # tetto RAM per le copertine
 WARMUP_WORKERS = 4
@@ -78,19 +86,22 @@ s3 = boto3.client(
         retries={"max_attempts": 3, "mode": "standard"},
         connect_timeout=5,
         read_timeout=20,
+        # boto3 >= 1.36 verifica per default il checksum dell'intero oggetto:
+        # con le Range request (download parziale) non puo' mai coincidere.
         request_checksum_calculation="when_required",
         response_checksum_validation="when_required",
     ),
 )
 
 app = Flask(__name__)
+# Render sta dietro un proxy: serve per avere https negli URL generati.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 for _code, _text in (
-    (400, "Richiesta non valida"),
-    (403, "Accesso negato"),
-    (404, "Non trovato"),
-    (502, "Errore del servizio di storage"),
+    (400, "Invalid request"),
+    (403, "Access denied, or the link has expired"),
+    (404, "Not found"),
+    (502, "Storage service error"),
 ):
   app.register_error_handler(_code, lambda e, t=_text, c=_code: (t, c))
 
@@ -157,15 +168,15 @@ def get_file_list(force=False):
   except (ClientError, BotoCoreError) as exc:
     log.warning("Errore lettura lista da R2: %s", exc)
     with _lock:
-      return list(_file_list)
+      return list(_file_list)  # meglio una lista vecchia che nessuna lista
 
   with _lock:
     for key, etag in index.items():
       previous = _file_index.get(key)
       if previous is not None and previous != etag:
-        _drop_cache(key)
+        _drop_cache(key)  # file sostituito: rilegge i tag
     for key in set(_file_index) - set(index):
-      _drop_cache(key)
+      _drop_cache(key)  # file rimosso
     _file_index = index
     _file_list = sorted(index, key=str.lower)
     _list_ts = time.time()
@@ -178,46 +189,71 @@ def is_known(key):
     return key in _file_index
 
 
-# ==================== LETTURA TAG ID3 E AUDIO ====================
-def _fetch_id3_bytes(key):
+# ==================== LETTURA DELL'INIZIO DEL FILE (tag ID3 + durata) ====================
+def _total_size(resp, fallback):
+  """Dimensione totale dell'oggetto, ricavata dall'header Content-Range."""
+  match = re.search(r"/(\d+)$", resp.get("ContentRange", "") or "")
+  return int(match.group(1)) if match else int(resp.get("ContentLength", fallback))
+
+
+def _estimate_duration(audio, tag_len, total_size):
+  """Durata in secondi leggendo solo l'inizio dell'audio (senza scaricare l'mp3)."""
+  if len(audio) < 1024:
+    return None
+  try:
+    info = MP3(io.BytesIO(audio)).info
+  except Exception:
+    return None
+  # Con header Xing/Info/VBRI il numero di frame e' scritto nel file: durata esatta.
+  if any(m in audio[:4096] for m in (b"Xing", b"Info", b"VBRI")) and info.length > 0:
+    return float(info.length)
+  # Altrimenti stima da bitrate costante e dimensione totale del file.
+  bitrate = getattr(info, "bitrate", 0)
+  if bitrate and total_size > tag_len:
+    return (total_size - tag_len) * 8 / bitrate
+  return None
+
+
+def _read_head(key):
+  """Legge SOLO l'inizio del file (Range request). Ritorna (tag ID3|None, durata|None)."""
   try:
     resp = s3.get_object(
         Bucket=R2_BUCKET_NAME, Key=key, Range=f"bytes=0-{INITIAL_RANGE - 1}"
     )
   except ClientError as exc:
     if exc.response.get("Error", {}).get("Code") == "InvalidRange":
-      return None
+      return None, None  # file vuoto
     raise
   data = resp["Body"].read()
-  if len(data) < 10 or data[:3] != b"ID3":
-    return None
+  total_size = _total_size(resp, len(data))
 
-  size = (
-      ((data[6] & 0x7F) << 21)
-      | ((data[7] & 0x7F) << 14)
-      | ((data[8] & 0x7F) << 7)
-      | (data[9] & 0x7F)
-  )
-  total = 10 + size + (10 if data[5] & 0x10 else 0)
-  if total > MAX_ID3_BYTES:
-    return None
-  if total > len(data) and len(data) >= INITIAL_RANGE:
-    rest = s3.get_object(
-        Bucket=R2_BUCKET_NAME, Key=key, Range=f"bytes={len(data)}-{total - 1}"
+  tag_len = 0
+  if len(data) >= 10 and data[:3] == b"ID3":
+    size = (
+        ((data[6] & 0x7F) << 21)
+        | ((data[7] & 0x7F) << 14)
+        | ((data[8] & 0x7F) << 7)
+        | (data[9] & 0x7F)
+    )
+    tag_len = 10 + size + (10 if data[5] & 0x10 else 0)  # header + corpo + footer
+    if tag_len > MAX_ID3_BYTES:
+      return None, None  # tag anomalo
+
+  # Completa il tag (se piu' grande del primo blocco) e legge un po' di audio.
+  wanted = tag_len + AUDIO_PROBE
+  if len(data) < wanted and len(data) < total_size:
+    end = min(wanted, total_size) - 1
+    data += s3.get_object(
+        Bucket=R2_BUCKET_NAME, Key=key, Range=f"bytes={len(data)}-{end}"
     )["Body"].read()
-    data += rest
-  return io.BytesIO(data[:total])
 
-
-def _fetch_tags(key):
-  raw = _fetch_id3_bytes(key)
-  if raw is None:
-    return None
-  try:
-    return ID3(raw)
-  except Exception as exc:
-    log.debug("Tag ID3 illeggibili per %s: %s", key, exc)
-    return None
+  tags = None
+  if tag_len:
+    try:
+      tags = ID3(io.BytesIO(data[:tag_len]))
+    except Exception as exc:  # tag corrotto o non standard
+      log.debug("Tag ID3 illeggibili per %s: %s", key, exc)
+  return tags, _estimate_duration(data[tag_len:], tag_len, total_size)
 
 
 def _extract_era(tags, key):
@@ -228,59 +264,38 @@ def _extract_era(tags, key):
         match = re.search(r"\d{4}", str(frame.text[0]))
         if match:
           return match.group(0)
-  match = re.search(r"\b(19\d{2}|20\d{2})\b", key)
-  return match.group(1) if match else "N/D"
+  match = re.search(r"\b(19\d{2}|20\d{2})\b", key)  # ultimo tentativo: percorso
+  return match.group(1) if match else None
 
 
 def _extract_artist(tags):
-  if tags is not None:
-    frame = tags.get("TPE1")
+  if tags is None:
+    return None
+  for frame_id in ("TPE1", "TPE2"):
+    frame = tags.get(frame_id)
     if frame is not None and getattr(frame, "text", None):
-      artist = str(frame.text[0]).strip()
-      if artist:
-        return artist
-  return None
-
-
-def _extract_duration(tags, key):
-  # 1. Tenta di leggere dal tag ID3 TLEN (durata in millisecondi)
-  if tags is not None:
-    frame = tags.get("TLEN")
-    if frame is not None and getattr(frame, "text", None):
-      try:
-        val = float(str(frame.text[0]).strip())
-        if val > 0:
-          return val / 1000.0
-      except (ValueError, TypeError):
-        pass
-
-  # 2. Se TLEN non è presente o non valido, scarica una porzione iniziale più ampia o usa mutagen.mp3 sull'oggetto stream
-  try:
-    resp = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key, Range="bytes=0-512000")
-    audio_data = io.BytesIO(resp["Body"].read())
-    audio = MP3(audio_data)
-    if audio.info and audio.info.length:
-      return float(audio.info.length)
-  except Exception as exc:
-    log.debug("Impossibile calcolare la durata da MP3 stream per %s: %s", key, exc)
-
+      names = [str(t).strip() for t in frame.text if str(t).strip()]
+      if names:
+        return ", ".join(names)
   return None
 
 
 def _extract_cover(tags):
-  if tags is not None:
-    pictures = tags.getall("APIC")
-    if pictures:
-      picture = next((p for p in pictures if p.type == 3), pictures[0])
-      data = picture.data
-      if data:
-        mime = (picture.mime or "").lower()
-        if mime == "image/jpg":
-          mime = "image/jpeg"
-        if not mime.startswith("image/"):
-          mime = "image/png" if data.startswith(b"\x89PNG") else "image/jpeg"
-        return data, mime
-  return None
+  if tags is None:
+    return None
+  pictures = tags.getall("APIC")
+  if not pictures:
+    return None
+  picture = next((p for p in pictures if p.type == 3), pictures[0])  # 3 = front
+  data = picture.data
+  if not data:
+    return None
+  mime = (picture.mime or "").lower()
+  if mime == "image/jpg":
+    mime = "image/jpeg"
+  if not mime.startswith("image/"):
+    mime = "image/png" if data.startswith(b"\x89PNG") else "image/jpeg"
+  return data, mime
 
 
 def load_track_info(key):
@@ -294,14 +309,14 @@ def load_track_info(key):
   album = parts[-2] if len(parts) > 1 else "Cloudflare R2"
   title = os.path.splitext(parts[-1])[0]
 
-  tags = _fetch_tags(key)
+  tags, duration = _read_head(key)
   cover = _extract_cover(tags)
   info = {
       "title": title,
-      "album": album,
       "artist": _extract_artist(tags),
-      "duration": _extract_duration(tags, key),
+      "album": album,
       "era": _extract_era(tags, key),
+      "duration": int(round(duration)) if duration else None,
       "has_cover": cover is not None,
   }
   with _lock:
@@ -327,7 +342,8 @@ def get_cover(key):
   if entry is not None:
     return entry
 
-  cover = _extract_cover(_fetch_tags(key))
+  # La copertina e' stata espulsa dalla cache LRU: la rileggo.
+  cover = _extract_cover(_read_head(key)[0])
   if cover is not None:
     with _lock:
       _store_cover(key, cover)
@@ -432,6 +448,7 @@ def api_metadata():
 
 @app.get("/cover")
 def cover():
+  # Pubblico (serve a Discord per la miniatura) ma solo per brani esistenti.
   key = request.args.get("file", "")
   if not key or not is_known(key):
     abort(404)
@@ -461,6 +478,7 @@ def download():
   if not key.lower().endswith(".mp3"):
     abort(403)
 
+  # Il download parte direttamente da R2: Render non trasporta il file.
   url = s3.generate_presigned_url(
       "get_object",
       Params={
